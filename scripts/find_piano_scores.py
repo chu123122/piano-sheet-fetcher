@@ -1,0 +1,631 @@
+#!/usr/bin/env python3
+"""Find complete piano score files for one song and save actionable results.
+
+Product entry point for piano-sheet-fetcher. It turns the multi-source lessons
+from Phase 2a into a stable user-facing workflow:
+
+- search public video/web sources for score links
+- download only public direct score artifacts
+- validate file signatures before success
+- list login-gated downloadable score pages separately
+- exclude paid/store/private-gated resources from downloads
+
+No login bypass, no paid download, no CAPTCHA/client automation.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import html
+import json
+import re
+import sys
+import time
+import urllib.parse
+import urllib.request
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+from classify_candidates import classify as classify_candidate  # noqa: E402
+from dedupe_candidates import dedupe as dedupe_candidates  # noqa: E402
+from status_enum import normalize_status  # noqa: E402
+
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36"
+SCORE_EXTS = {".pdf", ".mscz", ".mxl", ".musicxml", ".mid", ".midi", ".zip"}
+SUCCESS_EXTS = {".pdf", ".mscz", ".mxl", ".musicxml", ".zip"}
+PAID_HOST_HINTS = ["mymusicsheet", "mymusic.st", "kokomu", "piascore", "gumroad", "patreon", "ko-fi", "booth.pm", "theta", "thetapiano"]
+STORE_WORDS = re.compile(r"\b(?:purchase|buy|paid|cart)\b|gumroad|patreon|ko-fi|mymusicsheet|kokomu|piascore|booth|購入|有料|付费|购买|收费|thetapiano", re.I)
+GOOD_WORDS = re.compile(r"pdf|mscz|mxl|musicxml|sheet|score|楽譜|乐谱|鋼琴譜|钢琴谱|五线谱", re.I)
+URL_RE = re.compile(r"https?://[^\s<>'\"，。；、）)\]}]+", re.I)
+KEEP_HOST_HINTS = [
+    "drive.google", "dropbox", "1drv.ms", "onedrive", "mega.nz", "mediafire",
+    "github.com", "raw.githubusercontent", "sheet.host", "musescore.com",
+    "pianoscoreone", "blogspot", "wordpress", "gumroad", "patreon", "ko-fi",
+    "mymusicsheet", "mymusic.st", "kokomu", "piascore", "booth.pm",
+]
+KNOWN_ALIASES_PATH = SCRIPT_DIR.parent / "references" / "known_aliases.json"
+
+
+@dataclass
+class Song:
+    title: str
+    artist: str = ""
+    aliases: list[str] = field(default_factory=list)
+
+    @property
+    def id(self) -> str:
+        base = f"{self.title}-{self.artist}" if self.artist else self.title
+        return slugify(base, 90)
+
+
+@dataclass
+class Record:
+    url: str
+    status: str
+    classification: str
+    channel: str
+    source_url: str = ""
+    source_title: str = ""
+    platform: str = ""
+    visible_files: list[dict[str, str]] = field(default_factory=list)
+    local_path: str = ""
+    file_name: str = ""
+    file_kind: str = ""
+    bytes: int | None = None
+    sha256: str = ""
+    evidence: str = ""
+    error: str = ""
+
+
+def request(url: str, timeout: int = 30) -> tuple[int, str, str, bytes]:
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,ja;q=0.7"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status, r.geturl(), r.headers.get("Content-Type", ""), r.read()
+
+
+def text_request(url: str, timeout: int = 30) -> tuple[int, str, str]:
+    status, final, _ctype, data = request(url, timeout)
+    return status, final, data.decode("utf-8", errors="replace")
+
+
+def slugify(s: str, max_len: int = 80) -> str:
+    s = urllib.parse.unquote(str(s))
+    s = re.sub(r"[^\w._ -]+", " ", s, flags=re.UNICODE)
+    s = re.sub(r"\s+", "-", s.strip().lower()).strip("-._")
+    return (s[:max_len].strip("-._") or "score")
+
+
+def clean_url(url: str) -> str:
+    url = html.unescape(str(url).replace("\\/", "/"))
+    url = url.replace("\\u0026", "&").replace("\\u003d", "=").replace("\\u002F", "/")
+    url = re.split(r"(?:\\n|\\r|\\t|\\\\n|\\\\r|\\\\t|\\u003c|\\u003e|[<>])", url, 1)[0]
+    return url.rstrip(".,;:!?)]}")
+
+
+def normalize_external_url(url: str) -> str:
+    url = clean_url(url)
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return ""
+    if parsed.netloc.lower().endswith("youtube.com") and parsed.path.startswith("/redirect"):
+        q = urllib.parse.parse_qs(parsed.query).get("q")
+        if q:
+            return clean_url(q[0])
+    return url
+
+
+def host(url: str) -> str:
+    try:
+        return urllib.parse.urlparse(url).netloc.lower()
+    except ValueError:
+        return ""
+
+
+def canonical_url(url: str) -> str:
+    url = normalize_external_url(url)
+    if not url:
+        return ""
+    try:
+        p = urllib.parse.urlparse(url)
+    except ValueError:
+        return ""
+    query = urllib.parse.parse_qsl(p.query, keep_blank_values=True)
+    keep = [(k, v) for k, v in query if not k.lower().startswith("utm_") and k.lower() not in {"fbclid", "gclid"}]
+    return urllib.parse.urlunparse((p.scheme.lower() or "https", p.netloc.lower(), re.sub(r"/+$", "", p.path), "", urllib.parse.urlencode(keep), ""))
+
+
+def target_terms(song: Song) -> list[str]:
+    return [song.title, song.artist, *song.aliases]
+
+
+def ordered_unique(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        item = str(value).strip()
+        key = re.sub(r"\s+", "", item).lower()
+        if item and key not in seen:
+            seen.add(key)
+            out.append(item)
+    return out
+
+
+def load_known_aliases(title: str, artist: str = "") -> list[str]:
+    """Load deterministic cached aliases without binding the CLI to one song."""
+    if not KNOWN_ALIASES_PATH.exists():
+        return []
+    try:
+        data = json.loads(KNOWN_ALIASES_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    aliases: list[str] = []
+    for key in [title, artist]:
+        if key and isinstance(data.get(key), list):
+            aliases.extend(str(x) for x in data[key])
+    folded_title = re.sub(r"\s+", "", title).lower()
+    for key, vals in data.items():
+        folded_key = re.sub(r"\s+", "", str(key)).lower()
+        if folded_key and folded_key in folded_title and isinstance(vals, list):
+            aliases.extend(str(x) for x in vals)
+    return ordered_unique(aliases)
+
+
+def target_matches(song: Song, text: str) -> bool:
+    folded = re.sub(r"\s+", "", text).lower()
+    for term in target_terms(song):
+        t = re.sub(r"\s+", "", str(term)).lower()
+        if t and t in folded:
+            return True
+    return False
+
+
+def youtube_search(query: str, limit: int) -> tuple[list[str], str]:
+    url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(query)
+    try:
+        status, _final, raw = text_request(url)
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"
+    ids: list[str] = []
+    for vid in re.findall(r'"videoId"\s*:\s*"([A-Za-z0-9_-]{11})"', raw) + re.findall(r"watch\?v=([A-Za-z0-9_-]{11})", raw):
+        if vid not in ids:
+            ids.append(vid)
+    return [f"https://www.youtube.com/watch?v={v}" for v in ids[:limit]], f"HTTP {status}"
+
+
+def bing_search(query: str, limit: int) -> tuple[list[str], str]:
+    url = "https://www.bing.com/search?q=" + urllib.parse.quote(query)
+    try:
+        status, _final, raw = text_request(url)
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"
+    urls: list[str] = []
+    # Bing result markup varies; keep this conservative. YouTube usually carries
+    # most useful creator links, so search failure is not fatal.
+    patterns = [r'<a\s+href="(https?://[^"]+)"', r'"url"\s*:\s*"(https?://[^"]+)"']
+    for pat in patterns:
+        for m in re.finditer(pat, raw):
+            u = normalize_external_url(m.group(1))
+            h = host(u)
+            if not h or any(skip in h for skip in ["microsoft", "bing.com", "go.microsoft"]):
+                continue
+            if u not in urls:
+                urls.append(u)
+            if len(urls) >= limit:
+                return urls, f"HTTP {status}"
+    return urls, f"HTTP {status}"
+
+
+def extract_youtube_metadata(url: str) -> tuple[str, str, list[str], str]:
+    try:
+        status, _final, raw = text_request(url)
+    except Exception as e:
+        return "", "", [], f"{type(e).__name__}: {e}"
+    title = ""
+    mt = re.search(r'<meta\s+property="og:title"\s+content="([^"]*)"', raw)
+    if mt:
+        title = html.unescape(mt.group(1))
+    desc = ""
+    for pat in [r'"shortDescription"\s*:\s*"((?:\\.|[^"\\])*)"', r'<meta\s+name="description"\s+content="([^"]*)"']:
+        m = re.search(pat, raw)
+        if m:
+            val = m.group(1)
+            try:
+                desc = json.loads('"' + val + '"') if "\\" in val else html.unescape(val)
+            except Exception:
+                desc = html.unescape(val)
+            break
+    links: list[str] = []
+    blob = raw.replace("\\/", "/") + "\n" + desc
+    for m in URL_RE.finditer(blob):
+        u = normalize_external_url(m.group(0))
+        h = host(u)
+        if not h:
+            continue
+        suffix = Path(urllib.parse.urlparse(u).path).suffix.lower()
+        keep = any(k in h for k in KEEP_HOST_HINTS) or suffix in SCORE_EXTS or bool(STORE_WORDS.search(u))
+        if keep and u not in links:
+            links.append(u)
+    return title, desc, links[:60], f"HTTP {status}"
+
+
+def google_drive_file_id(url: str) -> str:
+    m = re.search(r"/file/d/([A-Za-z0-9_-]+)", url)
+    if m:
+        return m.group(1)
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    return (q.get("id") or [""])[0]
+
+
+def file_kind(data: bytes, final_url: str, ctype: str) -> str:
+    suffix = Path(urllib.parse.urlparse(final_url).path).suffix.lower()
+    base = ctype.lower().split(";", 1)[0].strip()
+    if data.startswith(b"%PDF") or suffix == ".pdf" or base == "application/pdf":
+        return "pdf"
+    if data.startswith(b"PK\x03\x04") or suffix in {".zip", ".mscz", ".mxl"} or base == "application/zip":
+        return suffix.lstrip(".") if suffix in {".mscz", ".mxl"} else "zip"
+    if suffix in {".musicxml"}:
+        return "musicxml"
+    if suffix in {".mid", ".midi"} or base in {"audio/midi", "audio/x-midi"}:
+        return "midi"
+    return "unknown"
+
+
+def is_success_kind(kind: str) -> bool:
+    return kind in {"pdf", "mscz", "mxl", "musicxml", "zip"}
+
+
+def write_artifact(song: Song, data: bytes, final_url: str, source_url: str, out_dir: Path, channel: str, kind: str) -> tuple[Path, str]:
+    downloads = out_dir / "downloads"
+    downloads.mkdir(parents=True, exist_ok=True)
+    suffix = "." + kind if kind in {"pdf", "mscz", "mxl", "musicxml", "zip"} else ".bin"
+    stem = slugify(f"{song.title}-{channel}-{Path(urllib.parse.urlparse(final_url).path).stem or 'download'}", 90)
+    path = downloads / f"{stem}{suffix}"
+    n = 2
+    while path.exists():
+        path = downloads / f"{stem}-{n}{suffix}"
+        n += 1
+    path.write_bytes(data)
+    sha = hashlib.sha256(data).hexdigest()
+    meta = {
+        "song": song.title,
+        "artist": song.artist,
+        "channel": channel,
+        "source_url": source_url,
+        "final_url": final_url,
+        "file_kind": kind,
+        "bytes": len(data),
+        "sha256": sha,
+        "downloaded_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "policy_note": "Public non-paid artifact fetched without bypassing login/pay/CAPTCHA/client gates; verify rights before redistribution.",
+    }
+    path.with_suffix(path.suffix + ".source.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path, sha
+
+
+def try_download(song: Song, url: str, source_url: str, source_title: str, channel: str, out_dir: Path) -> Record:
+    rec = Record(url=url, channel=channel, source_url=source_url, source_title=source_title, status="candidate", classification="direct_or_cloud", platform=host(url))
+    h = host(url)
+    download_url = url
+    if "drive.google.com" in h:
+        fid = google_drive_file_id(url)
+        if not fid:
+            rec.status = "manual_action_required"
+            rec.classification = "cloud_folder_or_unknown"
+            rec.evidence = "Google Drive folder or URL without file id; manual browser action needed."
+            return rec
+        download_url = "https://drive.google.com/uc?export=download&id=" + urllib.parse.quote(fid)
+        rec.classification = "google_drive_public_file"
+    try:
+        status, final, ctype, data = request(download_url, timeout=45)
+        kind = file_kind(data, final, ctype)
+        if not is_success_kind(kind):
+            rec.status = "manual_action_required"
+            rec.classification = "non_direct_or_untrusted_artifact"
+            rec.file_kind = kind
+            rec.evidence = f"HTTP {status}; content-type={ctype}; file signature={kind}; not counted as downloadable score."
+            return rec
+        path, sha = write_artifact(song, data, final, source_url, out_dir, channel, kind)
+        rec.status = "downloaded"
+        rec.classification = "full_score_file"
+        rec.local_path = str(path)
+        rec.file_name = path.name
+        rec.file_kind = kind
+        rec.bytes = len(data)
+        rec.sha256 = sha
+        rec.evidence = f"Downloaded {kind}; HTTP {status}; content-type={ctype}."
+        return rec
+    except Exception as e:
+        rec.status = "failed"
+        rec.error = f"{type(e).__name__}: {e}"
+        return rec
+
+
+def probe_sheethost(url: str, source_url: str = "", source_title: str = "") -> Record:
+    rec = Record(url=url, channel="sheethost", source_url=source_url or url, source_title=source_title, status="candidate", classification="score_platform", platform="sheet.host")
+    try:
+        status, _final, raw = text_request(url)
+    except Exception as e:
+        rec.status = "failed"
+        rec.error = f"{type(e).__name__}: {e}"
+        return rec
+    mt = re.search(r"<title[^>]*>([^<]+)", raw, re.I)
+    if mt and not rec.source_title:
+        rec.source_title = html.unescape(mt.group(1)).strip()
+    text = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", raw)))
+    visible: list[dict[str, str]] = []
+    for m in re.finditer(r"Download\s+([^()]{1,160}\.(?:pdf|mid|midi|mscz|mxl|musicxml|zip))\s*\(([^)]{1,40})\)", text, re.I):
+        name = m.group(1).strip()
+        ext = Path(name).suffix.lower().lstrip(".")
+        visible.append({"name": name, "kind": ext, "size": m.group(2).strip(), "access": "login_required" if "account/login" in raw else "visible"})
+    rec.visible_files = visible
+    if visible and "account/login" in raw:
+        rec.status = "login_required_downloadable"
+        rec.classification = "full_score_login_gated"
+        rec.evidence = "; ".join(f"{x['name']} ({x['size']})" for x in visible[:8])
+    elif visible:
+        rec.status = "login_required_downloadable"
+        rec.classification = "full_score_visible"
+        rec.evidence = "; ".join(f"{x['name']} ({x['size']})" for x in visible[:8])
+    else:
+        rec.status = "page_candidate"
+        rec.evidence = text[:300]
+    return rec
+
+
+def classify_page(url: str, source_url: str, source_title: str, channel: str) -> Record:
+    h = host(url)
+    if any(p in h for p in PAID_HOST_HINTS) or STORE_WORDS.search(url):
+        return Record(url=url, status="paid_or_store_excluded", classification="paid_or_store", channel=channel, source_url=source_url, source_title=source_title, platform=h)
+    if "musescore.com" in h:
+        return Record(url=url, status="page_candidate", classification="score_platform_candidate", channel=channel, source_url=source_url, source_title=source_title, platform=h, evidence="MuseScore score page candidate; download permission not confirmed.")
+    return Record(url=url, status="page_candidate", classification="unprobed_page", channel=channel, source_url=source_url, source_title=source_title, platform=h)
+
+
+def build_queries(song: Song) -> list[str]:
+    names = [song.title, *song.aliases]
+    if song.artist:
+        names.append(f"{song.title} {song.artist}")
+    templates = [
+        "{q} piano sheet pdf",
+        "{q} sheet music download",
+        "{q} pdf mscz musicxml",
+        "{q} site:sheet.host",
+        "{q} site:drive.google.com piano sheet",
+    ]
+    qs: list[str] = []
+    for n in names:
+        for t in templates:
+            q = t.format(q=n).strip()
+            if q not in qs:
+                qs.append(q)
+    return qs
+
+
+def discover(song: Song, out_dir: Path, youtube_limit: int, max_videos: int, web_limit: int) -> tuple[list[Record], list[dict[str, Any]]]:
+    records: list[Record] = []
+    logs: list[dict[str, Any]] = []
+    seen_videos: list[str] = []
+    seen_urls: set[str] = set()
+    queries = build_queries(song)
+
+    for q in queries[:8]:
+        urls, status = youtube_search(q, youtube_limit)
+        logs.append({"channel": "youtube_search", "query": q, "status": status, "found": len(urls)})
+        for u in urls:
+            if u not in seen_videos:
+                seen_videos.append(u)
+        time.sleep(0.15)
+
+    for video_url in seen_videos[:max_videos]:
+        title, desc, links, status = extract_youtube_metadata(video_url)
+        logs.append({"channel": "youtube_video", "query": video_url, "status": status, "found": len(links), "title": title})
+        text = "\n".join([title, desc, *links])
+        # Keep score-ish external links even if YouTube only returns generic metadata.
+        if not links and not (target_matches(song, text) or GOOD_WORDS.search(text)):
+            continue
+        for link in links:
+            link = normalize_external_url(link)
+            key = canonical_url(link)
+            if not key or key in seen_urls:
+                continue
+            seen_urls.add(key)
+            h = host(link)
+            if "sheet.host" in h:
+                records.append(probe_sheethost(link, video_url, title))
+            elif "drive.google.com" in h or Path(urllib.parse.urlparse(link).path).suffix.lower() in SUCCESS_EXTS:
+                records.append(try_download(song, link, video_url, title, "youtube", out_dir))
+            else:
+                records.append(classify_page(link, video_url, title, "youtube"))
+        time.sleep(0.2)
+
+    for q in queries[:web_limit]:
+        urls, status = bing_search(q, 8)
+        logs.append({"channel": "web_search", "query": q, "status": status, "found": len(urls)})
+        for u in urls:
+            u = normalize_external_url(u)
+            key = canonical_url(u)
+            if not key or key in seen_urls:
+                continue
+            seen_urls.add(key)
+            h = host(u)
+            if "sheet.host" in h:
+                records.append(probe_sheethost(u, q, ""))
+            elif "drive.google.com" in h or Path(urllib.parse.urlparse(u).path).suffix.lower() in SUCCESS_EXTS:
+                records.append(try_download(song, u, q, "", "web", out_dir))
+            else:
+                records.append(classify_page(u, q, "", "web"))
+        time.sleep(0.15)
+    return records, logs
+
+
+def dedupe_records(records: list[Record]) -> list[Record]:
+    priority = {
+        "downloaded": 100,
+        "login_required_downloadable": 80,
+        "manual_action_required": 50,
+        "page_candidate": 20,
+        "paid_or_store_excluded": 5,
+        "failed": 0,
+    }
+    best: dict[str, Record] = {}
+    for r in records:
+        key = canonical_url(r.url) or r.url or r.local_path
+        old = best.get(key)
+        if old is None or priority.get(r.status, 0) > priority.get(old.status, 0):
+            best[key] = r
+    return sorted(best.values(), key=lambda r: priority.get(r.status, 0), reverse=True)
+
+
+def classify_and_rank(out_dir: Path, records: list[Record]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    raw = [asdict(r) for r in records]
+    for item in raw:
+        item["status"] = normalize_status(item.get("status"))
+    (out_dir / "raw_candidates.json").write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+    classified = [classify_candidate(item, i) for i, item in enumerate(raw, 1)]
+    unknown = [x for x in classified if x.get("needs_ai")]
+    ranked = dedupe_candidates(classified)
+    (out_dir / "classified.json").write_text(json.dumps(classified, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "unknown_candidates.json").write_text(json.dumps(unknown, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "ranked.json").write_text(json.dumps(ranked, ensure_ascii=False, indent=2), encoding="utf-8")
+    return raw, classified, unknown, ranked
+
+
+def write_outputs(song: Song, out_dir: Path, ranked: list[dict[str, Any]], unknown: list[dict[str, Any]], logs: list[dict[str, Any]]) -> dict[str, Any]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    downloaded = [r for r in ranked if r.get("status") == "downloaded" and r.get("local_path")]
+    login_required = [
+        r for r in ranked
+        if r.get("status") == "login_required_downloadable"
+        and (
+            r.get("visible_files")
+            or "sheet.host" in str(r.get("url", "")).lower()
+        )
+    ]
+    manual = [r for r in ranked if r.get("status") == "manual_action_required"]
+    excluded = [r for r in ranked if r.get("status") == "paid_or_store_excluded"]
+    score_platform = [
+        r for r in ranked
+        if r.get("status") == "page_candidate"
+        and "score_platform" in str(r.get("classification", "")).lower()
+    ]
+    failures = [r for r in ranked if r.get("status") == "failed"]
+    result = {
+        "song": asdict(song),
+        "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "result_contract": "Either downloaded_files contains local complete-score artifacts, or login_required_downloadables lists pages with visible downloadable score files requiring normal login/platform flow.",
+        "unknown_candidates": unknown,
+        "downloaded_files": downloaded,
+        "login_required_downloadables": login_required,
+        "score_platform_candidates": score_platform,
+        "manual_action_required": manual,
+        "excluded_paid_or_store": excluded[:80],
+        "failures": failures[:40],
+        "all_records": ranked,
+        "logs": logs,
+    }
+    (out_dir / "RESULT.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    lines = [f"# Piano Score Result: {song.title}", "", f"- Artist: {song.artist}", f"- Output: `{out_dir}`", ""]
+    lines += ["## Downloaded files", ""]
+    if downloaded:
+        for r in downloaded:
+            lines += [f"- `{r.get('local_path')}`", f"  - kind: {r.get('file_kind')}; bytes: {r.get('bytes')}; sha256: `{r.get('sha256')}`", f"  - source: {r.get('source_url')}", ""]
+    else:
+        lines.append("- none")
+        lines.append("")
+
+    lines += ["## Login-required downloadable candidates", ""]
+    if login_required:
+        for r in login_required:
+            lines += [f"- {r.get('url')}", f"  - platform: {r.get('platform') or host(r.get('url',''))}", f"  - source: {r.get('source_url')}"]
+            if r.get("visible_files"):
+                for f in r.get("visible_files", []):
+                    lines.append(f"  - file: `{f.get('name')}` ({f.get('size')}, {f.get('access')})")
+            elif r.get("evidence"):
+                lines.append(f"  - evidence: {r.get('evidence')}")
+            lines.append("")
+    else:
+        lines.append("- none")
+        lines.append("")
+
+    lines += ["## Score platform candidates", ""]
+    if score_platform:
+        for r in score_platform[:20]:
+            lines += [f"- {r.get('url')}", f"  - reason: {r.get('evidence') or '; '.join(str(x) for x in r.get('reasons', []))}", f"  - source: {r.get('source_url')}", ""]
+    else:
+        lines.append("- none")
+        lines.append("")
+
+    lines += ["## Manual action / non-direct candidates", ""]
+    if manual:
+        for r in manual[:20]:
+            lines += [f"- {r.get('url')}", f"  - reason: {r.get('evidence') or r.get('classification')}", f"  - source: {r.get('source_url')}", ""]
+    else:
+        lines.append("- none")
+        lines.append("")
+
+    lines += ["## Excluded paid/store links", ""]
+    if excluded:
+        for r in excluded[:30]:
+            lines.append(f"- {r.get('url')}")
+        if len(excluded) > 30:
+            lines.append(f"- ... {len(excluded) - 30} more in RESULT.json")
+    else:
+        lines.append("- none")
+    lines.append("")
+
+    lines += ["## Unknown candidates", ""]
+    if unknown:
+        lines.append(f"- {len(unknown)} candidates require optional step7 adjudication. See `unknown_candidates.json`.")
+    else:
+        lines.append("- none")
+    lines.append("")
+
+    lines += ["## Search log", ""]
+    for log in logs:
+        lines.append(f"- {log['channel']} `{log['query']}`: {log['status']}; found={log['found']}")
+    (out_dir / "RESULT.md").write_text("\n".join(lines), encoding="utf-8")
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Find public non-paid complete piano score files for one song.")
+    ap.add_argument("song")
+    ap.add_argument("--artist", default="")
+    ap.add_argument("--alias", action="append", default=[])
+    ap.add_argument("--out", default="sheet-music")
+    ap.add_argument("--youtube-limit", type=int, default=12, help="Videos per YouTube query")
+    ap.add_argument("--max-videos", type=int, default=48, help="Max unique YouTube videos to inspect")
+    ap.add_argument("--web-limit", type=int, default=4, help="Number of web queries to run")
+    args = ap.parse_args(argv)
+
+    title = args.song.strip()
+    artist = args.artist.strip()
+    aliases = ordered_unique([*load_known_aliases(title, artist), *[a.strip() for a in args.alias if a.strip()]])
+    song = Song(title, artist, aliases)
+    root = Path(args.out) / song.id
+    records, logs = discover(song, root, args.youtube_limit, args.max_videos, args.web_limit)
+    _raw, _classified, unknown, ranked = classify_and_rank(root, records)
+    result = write_outputs(song, root, ranked, unknown, logs)
+    print(root / "RESULT.md")
+    print(json.dumps({
+        "downloaded_files": len(result["downloaded_files"]),
+        "login_required_downloadables": len(result["login_required_downloadables"]),
+        "manual_action_required": len(result["manual_action_required"]),
+        "result_md": str(root / "RESULT.md"),
+    }, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+    raise SystemExit(main())

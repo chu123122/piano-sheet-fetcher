@@ -26,13 +26,18 @@ import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from classify_candidates import classify as classify_candidate  # noqa: E402
 from dedupe_candidates import dedupe as dedupe_candidates  # noqa: E402
+from bilibili_full_score_hunt import (  # noqa: E402
+    extract_links as extract_bilibili_links,
+    search_bilibili as search_bilibili_videos,
+    video_url as bilibili_video_url,
+)
 from status_enum import normalize_status  # noqa: E402
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36"
@@ -45,6 +50,7 @@ URL_RE = re.compile(r"https?://[^\s<>'\"，。；、）)\]}]+", re.I)
 KEEP_HOST_HINTS = [
     "drive.google", "dropbox", "1drv.ms", "onedrive", "mega.nz", "mediafire",
     "github.com", "raw.githubusercontent", "sheet.host", "musescore.com",
+    "bilibili.com", "pan.baidu.com", "pan.quark.cn", "aliyundrive", "alipan",
     "pianoscoreone", "blogspot", "wordpress", "gumroad", "patreon", "ko-fi",
     "mymusicsheet", "mymusic.st", "kokomu", "piascore", "booth.pm",
 ]
@@ -80,6 +86,25 @@ class Record:
     sha256: str = ""
     evidence: str = ""
     error: str = ""
+
+
+@dataclass(frozen=True)
+class SourceContext:
+    song: Song
+    out_dir: Path
+    youtube_limit: int
+    max_videos: int
+    web_limit: int
+    text_inputs: list[str] = field(default_factory=list)
+
+
+SourceFn = Callable[[SourceContext], tuple[list[Record], list[dict[str, Any]]]]
+
+
+@dataclass(frozen=True)
+class SourcePlugin:
+    name: str
+    discover: SourceFn
 
 
 def request(url: str, timeout: int = 30) -> tuple[int, str, str, bytes]:
@@ -254,6 +279,21 @@ def extract_youtube_metadata(url: str) -> tuple[str, str, list[str], str]:
     return title, desc, links[:60], f"HTTP {status}"
 
 
+def extract_scoreish_links(text: str) -> list[str]:
+    """Extract public score-ish links from pasted text or source metadata."""
+    out: list[str] = []
+    for m in URL_RE.finditer(text):
+        u = normalize_external_url(m.group(0))
+        h = host(u)
+        if not h:
+            continue
+        suffix = Path(urllib.parse.urlparse(u).path).suffix.lower()
+        keep = any(k in h for k in KEEP_HOST_HINTS) or suffix in SCORE_EXTS or bool(STORE_WORDS.search(u))
+        if keep and u not in out:
+            out.append(u)
+    return out
+
+
 def google_drive_file_id(url: str) -> str:
     m = re.search(r"/file/d/([A-Za-z0-9_-]+)", url)
     if m:
@@ -383,8 +423,21 @@ def classify_page(url: str, source_url: str, source_title: str, channel: str) ->
     if any(p in h for p in PAID_HOST_HINTS) or STORE_WORDS.search(url):
         return Record(url=url, status="paid_or_store_excluded", classification="paid_or_store", channel=channel, source_url=source_url, source_title=source_title, platform=h)
     if "musescore.com" in h:
-        return Record(url=url, status="page_candidate", classification="score_platform_candidate", channel=channel, source_url=source_url, source_title=source_title, platform=h, evidence="MuseScore score page candidate; download permission not confirmed.")
+        return Record(url=url, status="page_candidate", classification="score_platform_page", channel=channel, source_url=source_url, source_title=source_title, platform=h, evidence="MuseScore score page candidate; download permission not confirmed.")
     return Record(url=url, status="page_candidate", classification="unprobed_page", channel=channel, source_url=source_url, source_title=source_title, platform=h)
+
+
+def handle_link(song: Song, link: str, source_url: str, source_title: str, channel: str, out_dir: Path) -> Record | None:
+    """Route one extracted link through deterministic handlers."""
+    link = normalize_external_url(link)
+    if not link:
+        return None
+    h = host(link)
+    if "sheet.host" in h:
+        return probe_sheethost(link, source_url, source_title)
+    if "drive.google.com" in h or Path(urllib.parse.urlparse(link).path).suffix.lower() in SUCCESS_EXTS:
+        return try_download(song, link, source_url, source_title, channel, out_dir)
+    return classify_page(link, source_url, source_title, channel)
 
 
 def build_queries(song: Song) -> list[str]:
@@ -405,6 +458,189 @@ def build_queries(song: Song) -> list[str]:
             if q not in qs:
                 qs.append(q)
     return qs
+
+
+def build_bilibili_queries(song: Song) -> list[str]:
+    names = [song.title, *song.aliases]
+    if song.artist:
+        names.append(f"{song.title} {song.artist}")
+    templates = [
+        "{q} 钢琴谱",
+        "{q} 五线谱",
+        "{q} 完整谱",
+        "{q} 附谱",
+        "{q} pdf mscz musicxml 网盘 提取码",
+    ]
+    qs: list[str] = []
+    for n in names:
+        for t in templates:
+            q = t.format(q=n).strip()
+            if q not in qs:
+                qs.append(q)
+    return qs
+
+
+def discover_pasted_text(ctx: SourceContext) -> tuple[list[Record], list[dict[str, Any]]]:
+    records: list[Record] = []
+    logs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, text in enumerate(ctx.text_inputs, 1):
+        links = extract_scoreish_links(text)
+        # Reuse Bilibili extractor to catch pan links/codes in Chinese text; URL
+        # handling still goes through this entrypoint's deterministic handlers.
+        for item in extract_bilibili_links(text):
+            url = str(item.get("url") or "")
+            if url and url not in links:
+                links.append(url)
+        logs.append({"channel": "pasted_text", "query": f"text_input_{index}", "status": "local_text", "found": len(links)})
+        for link in links:
+            key = canonical_url(link)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            rec = handle_link(ctx.song, link, f"pasted_text:{index}", "", "pasted_text", ctx.out_dir)
+            if rec:
+                # Keep nearby text as evidence for manual/cloud candidates.
+                if not rec.evidence:
+                    rec.evidence = re.sub(r"\s+", " ", text).strip()[:500]
+                records.append(rec)
+    return records, logs
+
+
+def discover_youtube(ctx: SourceContext) -> tuple[list[Record], list[dict[str, Any]]]:
+    records: list[Record] = []
+    logs: list[dict[str, Any]] = []
+    seen_videos: list[str] = []
+    seen_urls: set[str] = set()
+    for q in build_queries(ctx.song)[:8]:
+        urls, status = youtube_search(q, ctx.youtube_limit)
+        logs.append({"channel": "youtube_search", "query": q, "status": status, "found": len(urls)})
+        for u in urls:
+            if u not in seen_videos:
+                seen_videos.append(u)
+        time.sleep(0.15)
+
+    for video_url in seen_videos[:ctx.max_videos]:
+        title, desc, links, status = extract_youtube_metadata(video_url)
+        logs.append({"channel": "youtube_video", "query": video_url, "status": status, "found": len(links), "title": title})
+        text = "\n".join([title, desc, *links])
+        if not links and not (target_matches(ctx.song, text) or GOOD_WORDS.search(text)):
+            continue
+        for link in links:
+            key = canonical_url(link)
+            if not key or key in seen_urls:
+                continue
+            seen_urls.add(key)
+            rec = handle_link(ctx.song, link, video_url, title, "youtube", ctx.out_dir)
+            if rec:
+                records.append(rec)
+        time.sleep(0.2)
+    return records, logs
+
+
+def discover_bilibili(ctx: SourceContext) -> tuple[list[Record], list[dict[str, Any]]]:
+    records: list[Record] = []
+    logs: list[dict[str, Any]] = []
+    seen_bvids: list[str] = []
+    seen_urls: set[str] = set()
+    for q in build_bilibili_queries(ctx.song)[:8]:
+        bvids, status = search_bilibili_videos(q, max_results=ctx.youtube_limit)
+        logs.append({"channel": "bilibili_search", "query": q, "status": status, "found": len(bvids)})
+        for bvid in bvids:
+            if bvid not in seen_bvids:
+                seen_bvids.append(bvid)
+        time.sleep(0.15)
+    for bvid in seen_bvids[:ctx.max_videos]:
+        url = bilibili_video_url(bvid)
+        try:
+            _status, _final, raw = text_request(url)
+        except Exception as e:
+            logs.append({"channel": "bilibili_video", "query": url, "status": f"{type(e).__name__}: {e}", "found": 0})
+            continue
+        title = html.unescape((re.search(r"<title[^>]*>([^<]*)", raw, re.I) or ["", ""])[1])
+        links = extract_scoreish_links(raw)
+        for item in extract_bilibili_links(raw):
+            link = str(item.get("url") or "")
+            if link and link not in links:
+                links.append(link)
+        logs.append({"channel": "bilibili_video", "query": url, "status": "HTTP 200", "found": len(links), "title": title})
+        for link in links:
+            key = canonical_url(link)
+            if not key or key in seen_urls:
+                continue
+            seen_urls.add(key)
+            rec = handle_link(ctx.song, link, url, title, "bilibili", ctx.out_dir)
+            if rec:
+                records.append(rec)
+        time.sleep(0.2)
+    return records, logs
+
+
+def discover_github(ctx: SourceContext) -> tuple[list[Record], list[dict[str, Any]]]:
+    records: list[Record] = []
+    logs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    queries = []
+    for q in build_queries(ctx.song)[:4]:
+        queries.append(f"{q} site:github.com")
+        queries.append(f"{q} site:gist.github.com")
+    for q in queries[:ctx.web_limit * 2]:
+        urls, status = bing_search(q, 8)
+        logs.append({"channel": "github_search", "query": q, "status": status, "found": len(urls)})
+        for u in urls:
+            h = host(u)
+            if "github.com" not in h and "raw.githubusercontent.com" not in h:
+                continue
+            key = canonical_url(u)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            rec = handle_link(ctx.song, u, q, "", "github", ctx.out_dir)
+            if rec:
+                records.append(rec)
+        time.sleep(0.15)
+    return records, logs
+
+
+def discover_web(ctx: SourceContext) -> tuple[list[Record], list[dict[str, Any]]]:
+    records: list[Record] = []
+    logs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for q in build_queries(ctx.song)[:ctx.web_limit]:
+        urls, status = bing_search(q, 8)
+        logs.append({"channel": "web_search", "query": q, "status": status, "found": len(urls)})
+        for u in urls:
+            key = canonical_url(u)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            rec = handle_link(ctx.song, u, q, "", "web", ctx.out_dir)
+            if rec:
+                records.append(rec)
+        time.sleep(0.15)
+    return records, logs
+
+
+SOURCE_PLUGINS: dict[str, SourcePlugin] = {
+    "pasted_text": SourcePlugin("pasted_text", discover_pasted_text),
+    "youtube": SourcePlugin("youtube", discover_youtube),
+    "bilibili": SourcePlugin("bilibili", discover_bilibili),
+    "github": SourcePlugin("github", discover_github),
+    "web": SourcePlugin("web", discover_web),
+}
+
+
+def selected_source_names(requested: list[str], has_text: bool) -> list[str]:
+    names = requested or ["youtube", "bilibili", "github", "web"]
+    if has_text and "pasted_text" not in names:
+        names = ["pasted_text", *names]
+    out: list[str] = []
+    for name in names:
+        if name not in SOURCE_PLUGINS:
+            raise SystemExit(f"unknown source {name!r}; choose from {', '.join(SOURCE_PLUGINS)}")
+        if name not in out:
+            out.append(name)
+    return out
 
 
 def discover(song: Song, out_dir: Path, youtube_limit: int, max_videos: int, web_limit: int) -> tuple[list[Record], list[dict[str, Any]]]:

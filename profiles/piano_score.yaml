@@ -1,0 +1,7 @@
+profile: piano_score
+success: "完整钢琴谱：PDF、MSCZ、MXL、MusicXML、完整五线谱图片集，或明确包含这些格式的谱包。"
+auxiliary: "MIDI 可作为辅助线索，但 MIDI-only 不算完整钢琴谱成功。"
+exclude: "简谱、瀑布流、Synthesia-only、display-only 教程、非钢琴谱、与曲名不匹配。"
+success_formats: [pdf, mscz, mxl, musicxml, zip]
+extra_paid_domains: []
+preferred_channels: [youtube, github, web, bilibili]

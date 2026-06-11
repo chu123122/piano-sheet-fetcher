@@ -1,0 +1,7 @@
+profile: full_score
+success: "完整曲谱：PDF、MSCZ、MXL、MusicXML、完整谱面图片集或包含完整谱面的谱包。"
+auxiliary: "MIDI、简谱、Tab 可作辅助线索。"
+exclude: "纯视频、瀑布流、display-only、无文件链接、与曲名不匹配。"
+success_formats: [pdf, mscz, mxl, musicxml, jpg, png, zip]
+extra_paid_domains: []
+preferred_channels: [youtube, github, web, bilibili]

@@ -18,7 +18,7 @@ Hard rule:
 Runtime default:
 
 - Scripts own the main path.
-- AI is exception-based only: classify scripts emit `UNKNOWN`/conflict candidates; AI adjudicates that small batch once.
+- AI is exception-based only: classify scripts emit `UNKNOWN`/conflict candidates; the product entrypoint either merges one batched adjudication JSON or applies a conservative step7 fallback to keep the terminal report actionable.
 - Gate states are deterministic script states. Login, paid store, CAPTCHA, private message, group join, cloud-client requirement, and Baidu/Quark client gates do not trigger AI.
 - Direct download is attempted only for public direct artifact links such as GitHub/raw, Google Drive public file, Dropbox/OneDrive public file, Lanzou/123pan direct-public style links, or score-site direct artifacts.
 - Baidu Netdisk and SheetHost login-gated candidates are recorded with evidence; do not bypass login/client/anti-automation.
@@ -26,8 +26,9 @@ Runtime default:
 ## Script Pipeline
 
 1. **Input/profile/channel selection — script**
-   - Use profile defaults. Multi-channel is the current core direction when the user asks for song search.
+   - Use profile defaults from `profiles/<profile>.yaml`. Multi-channel is the current core direction when the user asks for song search.
    - Bilibili-only remains available only when the user explicitly narrows scope.
+   - Add a target profile by adding one yaml under `profiles/`; do not edit classifier or prompt code for profile-specific success rules.
 
 2. **Query generation — script, optional cached AI alias fill**
    - Use `scripts/generate_search_queries.py`.
@@ -52,6 +53,8 @@ Runtime default:
 
 6. **Candidate classification — script**
    - Use `scripts/classify_candidates.py`.
+   - This classifier is profile-agnostic. It handles hard gates and coarse file/page shape only.
+   - It must not decide whether a candidate is success for a selected target profile; that belongs to step7 rubric.
    - Output contract per candidate:
 
 ```json
@@ -59,17 +62,19 @@ Runtime default:
   "candidate_id": "...",
   "status": "downloaded|download_candidate|login_required_downloadable|manual_action_required|paid_or_store_excluded|private_gate|not_full_piano_score|midi_only_auxiliary|page_candidate|UNKNOWN|failed",
   "score": 0,
-  "match": {"piano_score": "success|auxiliary|exclude|UNKNOWN"},
+  "match": {"rubric": "UNKNOWN"},
   "reasons": ["..."],
   "evidence": ["原文片段"],
   "needs_ai": false
 }
 ```
 
-7. **UNKNOWN/conflict adjudication — AI once per run**
-   - Only if `unknown_candidates.json` is non-empty.
+7. **UNKNOWN/conflict adjudication — automated step7**
+   - The product entrypoint loads `profiles/<target_profile>.yaml` and writes `STEP7_PROMPT.md`, `unknown_candidates.original.json`, `unknown_candidates.json`, and `STEP7_DECISIONS.json`.
+   - Default behavior is `--unknown-policy conservative`: unresolved UNKNOWN candidates become `page_candidate` with a no-download fallback reason.
+   - To use an AI/human adjudication result, pass `--adjudication-json <decisions.json>`; decisions are merged by `candidate_id`.
    - Use `templates/unknown_adjudication_prompt.md`.
-   - AI returns JSON only; scripts consume the result or the operator applies it.
+   - AI returns JSON only; scripts consume the result.
    - Do not send already deterministic paid/login/private/direct cases to AI.
 
 8. **Dedupe + ranking — script**
@@ -80,6 +85,7 @@ Runtime default:
    - Use `scripts/fetch_sheet.py` for direct artifact URLs or public pages that expose a direct artifact.
    - Do not use it for paid/login/client-gated pages.
    - Validate file signatures before counting success; `application/octet-stream` alone is not enough.
+   - ZIP archives are inspected safely and target files are extracted; RAR/7Z are saved as `manual_action_required` because stdlib cannot safely expand them.
 
 10. **Organize local files — script**
    - Use `scripts/organize_local_score.py` after a file is downloaded normally or supplied by the user.
@@ -98,10 +104,32 @@ Default product command:
 python path\to\piano-sheet-fetcher\scripts\find_piano_scores.py "<song-title>" --out ".\sheet-music"
 ```
 
+Default source plugins are `youtube,bilibili,github,web`. Add public copied descriptions/comments with `--text` or `--text-file`; this automatically prepends the P0 `pasted_text` source.
+
 Optional metadata:
 
 ```powershell
 python path\to\piano-sheet-fetcher\scripts\find_piano_scores.py "<song-title>" --artist "<artist>" --alias "<alias>" --alias "<another-alias>" --out ".\sheet-music"
+```
+
+Target profile:
+
+```powershell
+python path\to\piano-sheet-fetcher\scripts\find_piano_scores.py "<song-title>" --profile "<profile-name>" --out ".\sheet-music"
+```
+
+Step7 adjudication controls:
+
+```powershell
+python path\to\piano-sheet-fetcher\scripts\find_piano_scores.py "<song-title>" --unknown-policy conservative --out ".\sheet-music"
+python path\to\piano-sheet-fetcher\scripts\find_piano_scores.py "<song-title>" --adjudication-json ".\step7-decisions.json" --out ".\sheet-music"
+```
+
+Scoped source run:
+
+```powershell
+python path\to\piano-sheet-fetcher\scripts\find_piano_scores.py "<song-title>" --source pasted_text --text-file ".\copied-description-and-comments.txt" --out ".\sheet-music"
+python path\to\piano-sheet-fetcher\scripts\find_piano_scores.py "<song-title>" --source bilibili --source github --out ".\sheet-music"
 ```
 
 Generate queries:
@@ -150,15 +178,18 @@ python path\to\piano-sheet-fetcher\scripts\organize_local_score.py ".\Downloads\
 
 ## Search Rules
 
-- Multi-channel search is now the default implementation direction: Bilibili, YouTube/video descriptions, public search result pages, SheetHost/MuseScore-like score pages, and public cloud/file links.
+- Multi-channel search is now the default implementation direction. The product entrypoint uses registered source plugins: `pasted_text`, `youtube`, `bilibili`, `github`, `web`.
 - Bilibili-only mode is a scoped mode, not the general product direction.
+- New sources should be added as source plugins, not as more `if/elif` inside the core classifier.
+- Profile success/exclusion semantics live in `profiles/*.yaml`, not in `classify_candidates.py`.
 - Prefer creator/uploader-posted links and visible public description/comment text.
 - Skip paid stores and membership-only resources as downloads; record them as exclusions.
 - SheetHost pages that list PDF/MID but route through login are `login_required_downloadable`.
 - MuseScore and ordinary score-platform pages are `page_candidate` unless normal downloadability is confirmed; keep platform detail in `classification`/`platform`.
 - Baidu/Quark/Aliyun/123pan links with extraction codes are `manual_action_required` unless a direct artifact can be downloaded normally.
-- Treat MIDI-only as `auxiliary` unless paired with PDF/MSCZ/MXL/MusicXML or a score bundle.
-- Simplified numbered notation, waterfall/Synthesia-only videos, and display-only tutorials are exclusions.
+- Treat profile-specific formats according to the selected `profiles/<profile>.yaml` rubric.
+- ZIP bundles count as success only after safe inspection finds target-profile files inside.
+- Simplified numbered notation, waterfall/Synthesia-only videos, and display-only tutorials are judged by the selected profile rubric.
 - Do not bypass account walls, payment, CAPTCHA, anti-bot controls, region restrictions, DRM, watermarking, or download limits.
 
 ## Output Contract
@@ -170,18 +201,23 @@ sheet-music/
     RESULT.json
     raw_candidates.json
     classified.json
+    unknown_candidates.original.json
+    STEP7_PROMPT.md
     unknown_candidates.json
+    STEP7_DECISIONS.json
     ranked.json
     downloads/
       title-source.pdf
       title-source.pdf.source.json
+      title-source.zip
+      title-source.zip.extracted/
 ```
 
 ## Failure Behavior
 
 Stop and report evidence when:
 
-- `unknown_candidates.json` is non-empty and AI adjudication has not been run.
+- `unknown_candidates.json` remains non-empty after step7 conservative fallback or adjudication merge.
 - only paid, private-gated, login-gated, or rights-unclear candidates exist.
 - only simplified notation, waterfall/Synthesia, MIDI-only, or display-only pages are found.
 - direct download fails or returns a non-score artifact.

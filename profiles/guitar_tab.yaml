@@ -1,0 +1,7 @@
+profile: guitar_tab
+success: "吉他谱/Tab：明确为 guitar tab、六线谱、和弦谱或 Guitar Pro 文件。"
+auxiliary: "MIDI、五线谱、钢琴谱只作辅助线索。"
+exclude: "非吉他谱、纯演奏视频、无谱面文件、与曲名不匹配。"
+success_formats: [pdf, gp, gp3, gp4, gp5, gpx, musicxml, html]
+extra_paid_domains: []
+preferred_channels: [web, github, youtube]

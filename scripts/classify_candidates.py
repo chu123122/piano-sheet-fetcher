@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""Deterministic candidate classifier for piano-sheet-fetcher.
+"""Profile-agnostic rough classifier for piano-sheet-fetcher.
 
-Owner: script. This is step 6 from design/AI与脚本职责划分.md.
-It classifies candidates into success/auxiliary/exclude/UNKNOWN and writes the
-small UNKNOWN batch that may be escalated to AI once.
+Owner: script. This step performs only deterministic, profile-independent work:
+
+- hard gates: paid/store, private/group, failed probes;
+- access gates: visible login-required files and manual/cloud actions;
+- file/page coarse shape: downloaded artifact, likely file candidate, page;
+- UNKNOWN isolation for rubric-based step7 adjudication.
+
+It must not decide whether a candidate is successful for a target profile. That
+decision belongs to step7 with profiles/<profile>.yaml.
 """
 from __future__ import annotations
 
@@ -18,30 +24,24 @@ from typing import Any
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
-from status_enum import CANONICAL_STATUSES, normalize_status  # noqa: E402
+from status_enum import normalize_status  # noqa: E402
 
-SUCCESS_FORMAT_RE = re.compile(r"\.?(pdf|mscz|mxl|musicxml)\b|五线谱|完整谱|full score|sheet music|score bundle|谱包", re.I)
-AUX_FORMAT_RE = re.compile(r"\.?(mid|midi)\b", re.I)
-EXCLUDE_RE = re.compile(r"简谱|数字谱|numbered|瀑布流|waterfall|synthesia|falling[- ]?note|tutorial|display[- ]?only|试听", re.I)
-PRIVATE_RE = re.compile(r"私信|进群|加群|qq群|微信群|关注后|三连后|后台|私聊|dm me|discord", re.I)
 PAID_RE = re.compile(r"\b(?:purchase|buy|paid|cart)\b|付费|购买|收费|有偿|購入|gumroad|patreon|ko-fi|booth|kokomu|mymusicsheet|mymusic\.st|piascore|thetapiano", re.I)
+PRIVATE_RE = re.compile(r"私信|进群|加群|qq群|微信群|关注后|三连后|后台|私聊|dm me|discord", re.I)
 LOGIN_RE = re.compile(r"login|required|sign in|会员|member|subscription|pro\+|account/login|登录|ログイン", re.I)
-DIRECT_HOST_RE = re.compile(r"drive\.google\.com|github\.com|raw\.githubusercontent\.com|dropbox\.com|1drv\.ms|lanzou|123pan|mediafire", re.I)
 CLOUD_HOST_RE = re.compile(r"pan\.baidu\.com|pan\.quark\.cn|aliyundrive|alipan|lanzou|123pan|drive\.google\.com|dropbox\.com|1drv\.ms", re.I)
+DIRECT_HOST_RE = re.compile(r"drive\.google\.com|github\.com|raw\.githubusercontent\.com|dropbox\.com|1drv\.ms|lanzou|123pan|mediafire", re.I)
 SCORE_PLATFORM_RE = re.compile(r"sheet\.host|musescore\.com", re.I)
+FILE_EXT_RE = re.compile(r"\.(?:pdf|mscz|mxl|musicxml|mid|midi|zip|rar|7z|jpg|jpeg|png|gp|gp3|gp4|gp5|gpx)(?:\b|$)", re.I)
 
 TERMINAL_STATUS_MAP = {
-    "downloaded": ("downloaded", "success", 100, "already downloaded and signature-validated"),
-    "download_success": ("downloaded", "success", 100, "already downloaded and signature-validated"),
-    "login_required_downloadable": ("login_required_downloadable", "success", 84, "visible score file requires normal login/platform flow"),
-    "visible_score_files": ("login_required_downloadable", "success", 82, "visible score file requires normal login/platform flow"),
-    "paid_or_store_excluded": ("paid_or_store_excluded", "exclude", 5, "paid/store signal"),
-    "private_gate": ("private_gate", "exclude", 5, "private message/group gate"),
-    "not_full_piano_score": ("not_full_piano_score", "exclude", 10, "not a complete piano score"),
-    "midi_only_auxiliary": ("midi_only_auxiliary", "auxiliary", 35, "MIDI only"),
-    "failed": ("failed", "exclude", 0, "probe or download failed"),
-    "download_failed": ("failed", "exclude", 0, "download failed"),
-    "probe_failed": ("failed", "exclude", 0, "probe failed"),
+    "downloaded": ("downloaded", 100, "already downloaded and signature-validated", False),
+    "download_success": ("downloaded", 100, "already downloaded and signature-validated", False),
+    "paid_or_store_excluded": ("paid_or_store_excluded", 5, "paid/store signal", False),
+    "private_gate": ("private_gate", 5, "private message/group gate", False),
+    "failed": ("failed", 0, "probe or download failed", False),
+    "download_failed": ("failed", 0, "download failed", False),
+    "probe_failed": ("failed", 0, "probe failed", False),
 }
 
 
@@ -66,7 +66,7 @@ def flatten_payload(payload: Any) -> list[dict[str, Any]]:
 
 def text_of(item: dict[str, Any]) -> str:
     parts: list[str] = []
-    for key in ["song", "title", "format", "access", "status", "classification", "evidence", "notes", "reason", "context", "url", "source_url"]:
+    for key in ["song", "title", "format", "access", "status", "classification", "evidence", "notes", "reason", "context", "url", "source_url", "file_kind", "file_name"]:
         val = item.get(key)
         if val is None:
             continue
@@ -79,63 +79,71 @@ def text_of(item: dict[str, Any]) -> str:
             parts.extend(str(link.get(k, "")) for k in ["url", "context", "kind", "access_code"])
         else:
             parts.append(str(link))
+    for f in item.get("visible_files", []) if isinstance(item.get("visible_files"), list) else []:
+        if isinstance(f, dict):
+            parts.extend(str(f.get(k, "")) for k in ["name", "kind", "size", "access"])
     return "\n".join(parts)
+
+
+def visible_file_kinds(item: dict[str, Any]) -> list[str]:
+    kinds: list[str] = []
+    for f in item.get("visible_files", []) if isinstance(item.get("visible_files"), list) else []:
+        if isinstance(f, dict):
+            kind = str(f.get("kind", "")).lower().lstrip(".")
+            name = str(f.get("name", "")).lower()
+            if kind:
+                kinds.append(kind)
+            else:
+                m = FILE_EXT_RE.search(name)
+                if m:
+                    kinds.append(m.group(0).lstrip("."))
+    return kinds
 
 
 def classify(item: dict[str, Any], index: int) -> dict[str, Any]:
     text = text_of(item)
     url = str(item.get("url") or item.get("source_url") or "")
     host = urllib.parse.urlparse(url).netloc.lower() if url else ""
+    incoming_status = str(item.get("status") or "")
     reasons: list[str] = []
     status = "UNKNOWN"
-    profile = "UNKNOWN"
     score = 0
+    needs_ai = True
 
-    has_success_format = bool(SUCCESS_FORMAT_RE.search(text))
-    has_aux_format = bool(AUX_FORMAT_RE.search(text))
-    has_exclude = bool(EXCLUDE_RE.search(text))
     has_paid = bool(PAID_RE.search(text))
     has_private = bool(PRIVATE_RE.search(text))
     has_login = bool(LOGIN_RE.search(text))
-    has_direct_host = bool(DIRECT_HOST_RE.search(url))
     has_cloud = bool(CLOUD_HOST_RE.search(url))
-    has_score_platform = bool(SCORE_PLATFORM_RE.search(url))
-    incoming_status = str(item.get("status") or "")
-    visible_files = item.get("visible_files") if isinstance(item.get("visible_files"), list) else []
+    has_direct = bool(DIRECT_HOST_RE.search(url))
+    has_platform = bool(SCORE_PLATFORM_RE.search(url))
+    has_file_ext = bool(FILE_EXT_RE.search(text) or FILE_EXT_RE.search(url) or item.get("file_kind"))
+    visible_kinds = visible_file_kinds(item)
 
     if incoming_status in TERMINAL_STATUS_MAP:
-        status, profile, score, reason = TERMINAL_STATUS_MAP[incoming_status]
+        status, score, reason, needs_ai = TERMINAL_STATUS_MAP[incoming_status]
         reasons.append(reason)
-    elif visible_files and any(str(f.get("kind", "")).lower() in {"pdf", "mscz", "mxl", "musicxml", "zip"} for f in visible_files if isinstance(f, dict)):
-        status = "login_required_downloadable"; profile = "success"; score = 84; reasons.append("visible full-score file listed")
     elif has_paid:
-        status = "paid_or_store_excluded"; profile = "exclude"; score = 5; reasons.append("paid/store signal")
+        status = "paid_or_store_excluded"; score = 5; needs_ai = False; reasons.append("paid/store signal")
     elif has_private:
-        status = "private_gate"; profile = "exclude"; score = 5; reasons.append("private message/group gate")
-    elif has_exclude and not has_success_format:
-        status = "not_full_piano_score"; profile = "exclude"; score = 10; reasons.append("numbered/waterfall/display-only signal without full-score format")
-    elif has_login and has_success_format:
-        status = "login_required_downloadable"; profile = "success"; score = 82; reasons.append("full-score file visible but login-gated")
-    elif has_score_platform and has_success_format:
-        status = "page_candidate"; profile = "UNKNOWN"; score = 55; reasons.append("score platform page with full-score evidence; downloadability not confirmed")
-    elif has_direct_host and has_success_format:
-        status = "download_candidate"; profile = "success"; score = 95; reasons.append("public/direct host plus full-score format")
-    elif has_cloud and has_success_format:
-        status = "manual_action_required"; profile = "success"; score = 80; reasons.append("cloud share plus full-score format requires normal browser/client flow")
-    elif has_aux_format and not has_success_format:
-        status = "midi_only_auxiliary"; profile = "auxiliary"; score = 35; reasons.append("MIDI only")
-    elif has_success_format and has_exclude:
-        status = "UNKNOWN"; profile = "UNKNOWN"; score = 50; reasons.append("conflict: full-score and exclusion signals")
-    elif has_success_format:
-        status = "UNKNOWN"; profile = "UNKNOWN"; score = 55; reasons.append("full-score signal without access/source certainty")
-    elif url:
-        status = "page_candidate"; profile = "UNKNOWN"; score = 30; reasons.append("page link without enough score/access evidence")
+        status = "private_gate"; score = 5; needs_ai = False; reasons.append("private message/group gate")
+    elif incoming_status in {"login_required_downloadable", "visible_score_files"} or (visible_kinds and has_login):
+        status = "login_required_downloadable"; score = 75; needs_ai = True; reasons.append("visible files behind normal login/platform flow; profile success decided by rubric")
+    elif incoming_status == "manual_action_required" or (has_cloud and not has_direct):
+        status = "manual_action_required"; score = 45; needs_ai = True; reasons.append("normal manual/browser/client action required; profile success decided by rubric")
+    elif incoming_status == "midi_only_auxiliary":
+        status = "UNKNOWN"; score = 35; needs_ai = True; reasons.append("file candidate; target-profile success decided by rubric")
+    elif has_file_ext and has_direct:
+        status = "UNKNOWN"; score = 70; needs_ai = True; reasons.append("direct/file candidate; target-profile success decided by rubric")
+    elif has_file_ext:
+        status = "UNKNOWN"; score = 55; needs_ai = True; reasons.append("file-like evidence; target-profile success decided by rubric")
+    elif has_platform or url:
+        status = "page_candidate"; score = 30; needs_ai = True; reasons.append("page candidate; target-profile success decided by rubric")
     else:
-        status = "not_full_piano_score"; profile = "exclude"; score = 0; reasons.append("no URL or score evidence")
+        status = "UNKNOWN"; score = 0; needs_ai = True; reasons.append("insufficient evidence")
 
     status = normalize_status(status)
 
-    evidence = []
+    evidence: list[str] = []
     compact = re.sub(r"\s+", " ", text).strip()
     if compact:
         evidence.append(compact[:500])
@@ -147,21 +155,20 @@ def classify(item: dict[str, Any], index: int) -> dict[str, Any]:
         "candidate_id": item.get("candidate_id") or f"c{index:04d}",
         "status": status,
         "score": score,
-        "match": {"piano_score": profile},
+        "match": {"rubric": "UNKNOWN"},
         "reasons": reasons,
         "evidence": evidence,
-        "needs_ai": profile == "UNKNOWN" or status == "UNKNOWN",
+        "needs_ai": needs_ai,
     })
     return out
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Classify score candidates deterministically and emit UNKNOWN batch for optional AI adjudication.")
+    ap = argparse.ArgumentParser(description="Profile-agnostic rough classifier; emits UNKNOWN batch for rubric step7.")
     ap.add_argument("input_json")
     ap.add_argument("--out", required=True)
     ap.add_argument("--unknown-out", default="")
     args = ap.parse_args()
-    _ = CANONICAL_STATUSES
 
     payload = json.loads(Path(args.input_json).read_text(encoding="utf-8"))
     items = flatten_payload(payload)
@@ -178,6 +185,7 @@ def main() -> int:
     if args.unknown_out:
         print(args.unknown_out)
     return 0
+
 
 if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):

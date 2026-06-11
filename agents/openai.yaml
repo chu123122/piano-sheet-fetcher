@@ -1,4 +1,4 @@
 interface:
   display_name: "Piano Sheet Fetcher"
-  short_description: "Fetch J-pop piano sheets locally"
-  default_prompt: "Find a legally accessible piano sheet for the requested song and save it locally with source notes."
+  short_description: "Find public score files with rubric-based profiles"
+  default_prompt: "Find public non-paid score files for the requested song and save or report local results with source evidence."

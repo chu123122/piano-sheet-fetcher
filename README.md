@@ -22,6 +22,15 @@ python .\scripts\find_piano_scores.py "<song-title>" --out ".\sheet-music"
 python .\scripts\find_piano_scores.py "<song-title>" --artist "<artist>" --alias "<alias>" --out ".\sheet-music"
 ```
 
+选择目标 profile：
+
+```powershell
+python .\scripts\find_piano_scores.py "<song-title>" --profile piano_score --out ".\sheet-music"
+python .\scripts\find_piano_scores.py "<song-title>" --profile midi --out ".\sheet-music"
+```
+
+可用 profile 由 `profiles/*.yaml` 动态加载。新增 profile 时只新增 yaml；不要为 profile 成功/排除规则修改 `classify_candidates.py` 或 prompt 代码。
+
 例子：
 
 ```powershell
@@ -35,6 +44,7 @@ python .\scripts\find_piano_scores.py "ただ君に晴れ" --artist "Yorushika" 
 - 下载成功前会检查文件签名/扩展名，避免把网页或 `.bin` 冒充成谱；
 - 输出 Markdown 报告和 JSON 中间产物；
 - 区分已下载、可下载但需登录、需要人工动作、付费/商店排除、私信/进群门槛、MIDI-only、非完整谱、未知候选等情况。
+- 用 `profiles/<profile>.yaml` 的 rubric 决定候选对目标 profile 是否成功；脚本分类器只做硬门控和粗筛。
 
 成功格式包括：
 
@@ -118,5 +128,8 @@ sheet-music/
 
 ## 当前定位
 
-这个仓库目前更接近“钢琴谱查找下载 skill v0.1”，不是完整通用曲谱搜索框架。  
-如果未来要支持 MIDI、简谱、吉他谱、多 profile、多 source plugin，可以在现有分类和 source probe 基础上继续拆分。
+这个仓库目前是“rubric 化的曲谱查找 skill v0.2”：
+
+- `piano_score` / `midi` 已完成一轮真实入口回归；
+- `numbered_notation` / `guitar_tab` / `full_score` / `any_score` 已有 rubric 草案，但仍应视为 experimental，点亮前需要各自跑真实样本回归；
+- source plugin 架构已有雏形，新增来源应注册 source plugin，而不是继续往核心分类器里堆 `if/elif`。

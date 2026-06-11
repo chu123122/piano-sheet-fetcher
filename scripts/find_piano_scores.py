@@ -24,6 +24,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import zipfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -39,10 +40,18 @@ from bilibili_full_score_hunt import (  # noqa: E402
     video_url as bilibili_video_url,
 )
 from status_enum import normalize_status  # noqa: E402
+from profile_utils import (  # noqa: E402
+    load_profile,
+    profile_names,
+    profile_rubric_text,
+    profile_target_kinds,
+    profile_target_suffixes,
+)
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36"
-SCORE_EXTS = {".pdf", ".mscz", ".mxl", ".musicxml", ".mid", ".midi", ".zip"}
-SUCCESS_EXTS = {".pdf", ".mscz", ".mxl", ".musicxml", ".zip"}
+SCORE_EXTS = {".pdf", ".mscz", ".mxl", ".musicxml", ".mid", ".midi", ".zip", ".rar", ".7z"}
+SUCCESS_EXTS = {".pdf", ".mscz", ".mxl", ".musicxml"}
+ARCHIVE_EXTS = {".zip", ".rar", ".7z"}
 PAID_HOST_HINTS = ["mymusicsheet", "mymusic.st", "kokomu", "piascore", "gumroad", "patreon", "ko-fi", "booth.pm", "theta", "thetapiano"]
 STORE_WORDS = re.compile(r"\b(?:purchase|buy|paid|cart)\b|gumroad|patreon|ko-fi|mymusicsheet|kokomu|piascore|booth|購入|有料|付费|购买|收费|thetapiano", re.I)
 GOOD_WORDS = re.compile(r"pdf|mscz|mxl|musicxml|sheet|score|楽譜|乐谱|鋼琴譜|钢琴谱|五线谱", re.I)
@@ -84,6 +93,7 @@ class Record:
     file_kind: str = ""
     bytes: int | None = None
     sha256: str = ""
+    archive_files: list[dict[str, Any]] = field(default_factory=list)
     evidence: str = ""
     error: str = ""
 
@@ -95,6 +105,8 @@ class SourceContext:
     youtube_limit: int
     max_videos: int
     web_limit: int
+    target_profile: str = "piano_score"
+    profile: dict[str, Any] = field(default_factory=dict)
     text_inputs: list[str] = field(default_factory=list)
 
 
@@ -313,17 +325,82 @@ def file_kind(data: bytes, final_url: str, ctype: str) -> str:
         return "musicxml"
     if suffix in {".mid", ".midi"} or base in {"audio/midi", "audio/x-midi"}:
         return "midi"
+    if data.startswith(b"Rar!\x1a\x07") or suffix == ".rar":
+        return "rar"
+    if data.startswith(b"7z\xbc\xaf\x27\x1c") or suffix == ".7z":
+        return "7z"
     return "unknown"
 
 
-def is_success_kind(kind: str) -> bool:
-    return kind in {"pdf", "mscz", "mxl", "musicxml", "zip"}
+def target_file_kinds(profile: dict[str, Any]) -> set[str]:
+    return profile_target_kinds(profile)
+
+
+def is_success_kind(kind: str, profile: dict[str, Any]) -> bool:
+    return kind in target_file_kinds(profile)
+
+
+def archive_target_suffixes(profile: dict[str, Any]) -> set[str]:
+    return profile_target_suffixes(profile)
+
+
+def safe_archive_name(name: str) -> str:
+    name = name.replace("\\", "/")
+    parts = [p for p in name.split("/") if p not in {"", ".", ".."}]
+    return slugify("-".join(parts), 120)
+
+
+def extract_zip_targets(zip_path: Path, profile: dict[str, Any]) -> list[dict[str, Any]]:
+    """Safely extract target score files from a ZIP archive.
+
+    Only profile-target files are extracted. Path traversal and huge entries are
+    skipped. Nested archives are recorded but not recursively expanded.
+    """
+    targets = archive_target_suffixes(profile)
+    extracted_dir = zip_path.with_suffix(zip_path.suffix + ".extracted")
+    extracted: list[dict[str, Any]] = []
+    with zipfile.ZipFile(zip_path) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            member = info.filename.replace("\\", "/")
+            suffix = Path(member).suffix.lower()
+            if suffix not in targets:
+                continue
+            if member.startswith("/") or ".." in member.split("/"):
+                extracted.append({"name": info.filename, "status": "skipped_unsafe_path"})
+                continue
+            if info.file_size > 100 * 1024 * 1024:
+                extracted.append({"name": info.filename, "status": "skipped_too_large", "bytes": info.file_size})
+                continue
+            extracted_dir.mkdir(parents=True, exist_ok=True)
+            out_name = safe_archive_name(member)
+            if not out_name.lower().endswith(suffix):
+                out_name += suffix
+            out_path = extracted_dir / out_name
+            n = 2
+            while out_path.exists():
+                out_path = extracted_dir / f"{Path(out_name).stem}-{n}{suffix}"
+                n += 1
+            with zf.open(info) as src:
+                data = src.read()
+            out_path.write_bytes(data)
+            extracted.append({
+                "name": info.filename,
+                "kind": suffix.lstrip(".") if suffix not in {".mid", ".midi"} else "midi",
+                "bytes": len(data),
+                "local_path": str(out_path),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "status": "extracted",
+            })
+    return extracted
 
 
 def write_artifact(song: Song, data: bytes, final_url: str, source_url: str, out_dir: Path, channel: str, kind: str) -> tuple[Path, str]:
     downloads = out_dir / "downloads"
     downloads.mkdir(parents=True, exist_ok=True)
-    suffix = "." + kind if kind in {"pdf", "mscz", "mxl", "musicxml", "zip"} else ".bin"
+    suffix_map = {"pdf": ".pdf", "mscz": ".mscz", "mxl": ".mxl", "musicxml": ".musicxml", "zip": ".zip", "midi": ".mid", "rar": ".rar", "7z": ".7z"}
+    suffix = suffix_map.get(kind, ".bin")
     stem = slugify(f"{song.title}-{channel}-{Path(urllib.parse.urlparse(final_url).path).stem or 'download'}", 90)
     path = downloads / f"{stem}{suffix}"
     n = 2
@@ -348,7 +425,7 @@ def write_artifact(song: Song, data: bytes, final_url: str, source_url: str, out
     return path, sha
 
 
-def try_download(song: Song, url: str, source_url: str, source_title: str, channel: str, out_dir: Path) -> Record:
+def try_download(song: Song, url: str, source_url: str, source_title: str, channel: str, out_dir: Path, profile: dict[str, Any]) -> Record:
     rec = Record(url=url, channel=channel, source_url=source_url, source_title=source_title, status="candidate", classification="direct_or_cloud", platform=host(url))
     h = host(url)
     download_url = url
@@ -364,11 +441,50 @@ def try_download(song: Song, url: str, source_url: str, source_title: str, chann
     try:
         status, final, ctype, data = request(download_url, timeout=45)
         kind = file_kind(data, final, ctype)
-        if not is_success_kind(kind):
+        if kind == "zip":
+            path, sha = write_artifact(song, data, final, source_url, out_dir, channel, kind)
+            rec.local_path = str(path)
+            rec.file_name = path.name
+            rec.file_kind = kind
+            rec.bytes = len(data)
+            rec.sha256 = sha
+            try:
+                extracted = extract_zip_targets(path, profile)
+            except Exception as exc:
+                rec.status = "manual_action_required"
+                rec.classification = "archive_unreadable"
+                rec.evidence = f"Downloaded ZIP but could not inspect safely: {type(exc).__name__}: {exc}"
+                return rec
+            rec.archive_files = extracted
+            good = [x for x in extracted if x.get("status") == "extracted"]
+            if good:
+                rec.status = "downloaded"
+                rec.classification = f"{profile.get('profile', 'target')}_archive"
+                rec.evidence = f"Downloaded ZIP and extracted {len(good)} target file(s)."
+            else:
+                rec.status = "manual_action_required"
+                rec.classification = "archive_no_target_files"
+                rec.evidence = f"Downloaded ZIP but no {profile.get('profile', 'target')} target files were found inside."
+            return rec
+        if kind in {"rar", "7z"}:
+            path, sha = write_artifact(song, data, final, source_url, out_dir, channel, kind)
+            rec.status = "manual_action_required"
+            rec.classification = "unsupported_archive"
+            rec.local_path = str(path)
+            rec.file_name = path.name
+            rec.file_kind = kind
+            rec.bytes = len(data)
+            rec.sha256 = sha
+            rec.evidence = f"Downloaded {kind} archive; extraction requires external tool, not counted as success."
+            return rec
+        if not is_success_kind(kind, profile):
             rec.status = "manual_action_required"
             rec.classification = "non_direct_or_untrusted_artifact"
             rec.file_kind = kind
-            rec.evidence = f"HTTP {status}; content-type={ctype}; file signature={kind}; not counted as downloadable score."
+            if kind == "midi" and profile.get("profile") == "piano_score":
+                rec.status = "midi_only_auxiliary"
+                rec.classification = "midi_only"
+            rec.evidence = f"HTTP {status}; content-type={ctype}; file signature={kind}; target_profile={profile.get('profile', '')}; not counted as target success."
             return rec
         path, sha = write_artifact(song, data, final, source_url, out_dir, channel, kind)
         rec.status = "downloaded"
@@ -399,9 +515,16 @@ def probe_sheethost(url: str, source_url: str = "", source_title: str = "") -> R
         rec.source_title = html.unescape(mt.group(1)).strip()
     text = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", raw)))
     visible: list[dict[str, str]] = []
-    for m in re.finditer(r"Download\s+([^()]{1,160}\.(?:pdf|mid|midi|mscz|mxl|musicxml|zip))\s*\(([^)]{1,40})\)", text, re.I):
+    for m in re.finditer(r"(?:Download\s+)?([^()]{1,160}\.(?:pdf|mid|midi|mscz|mxl|musicxml|zip))\s*\(([^)]{1,40})\)", text, re.I):
         name = m.group(1).strip()
+        if re.search(r"\bDownload\s+", name, re.I):
+            name = re.split(r"\bDownload\s+", name, flags=re.I)[-1]
+        if "-->" in name:
+            name = name.rsplit("-->", 1)[-1]
+        name = re.sub(r"^Download\s+", "", name, flags=re.I).strip()
         ext = Path(name).suffix.lower().lstrip(".")
+        if not ext:
+            continue
         visible.append({"name": name, "kind": ext, "size": m.group(2).strip(), "access": "login_required" if "account/login" in raw else "visible"})
     rec.visible_files = visible
     if visible and "account/login" in raw:
@@ -427,7 +550,7 @@ def classify_page(url: str, source_url: str, source_title: str, channel: str) ->
     return Record(url=url, status="page_candidate", classification="unprobed_page", channel=channel, source_url=source_url, source_title=source_title, platform=h)
 
 
-def handle_link(song: Song, link: str, source_url: str, source_title: str, channel: str, out_dir: Path) -> Record | None:
+def handle_link(song: Song, link: str, source_url: str, source_title: str, channel: str, out_dir: Path, profile: dict[str, Any]) -> Record | None:
     """Route one extracted link through deterministic handlers."""
     link = normalize_external_url(link)
     if not link:
@@ -435,8 +558,8 @@ def handle_link(song: Song, link: str, source_url: str, source_title: str, chann
     h = host(link)
     if "sheet.host" in h:
         return probe_sheethost(link, source_url, source_title)
-    if "drive.google.com" in h or Path(urllib.parse.urlparse(link).path).suffix.lower() in SUCCESS_EXTS:
-        return try_download(song, link, source_url, source_title, channel, out_dir)
+    if "drive.google.com" in h or Path(urllib.parse.urlparse(link).path).suffix.lower() in SCORE_EXTS:
+        return try_download(song, link, source_url, source_title, channel, out_dir, profile)
     return classify_page(link, source_url, source_title, channel)
 
 
@@ -498,7 +621,7 @@ def discover_pasted_text(ctx: SourceContext) -> tuple[list[Record], list[dict[st
             if not key or key in seen:
                 continue
             seen.add(key)
-            rec = handle_link(ctx.song, link, f"pasted_text:{index}", "", "pasted_text", ctx.out_dir)
+            rec = handle_link(ctx.song, link, f"pasted_text:{index}", "", "pasted_text", ctx.out_dir, ctx.profile)
             if rec:
                 # Keep nearby text as evidence for manual/cloud candidates.
                 if not rec.evidence:
@@ -512,7 +635,7 @@ def discover_youtube(ctx: SourceContext) -> tuple[list[Record], list[dict[str, A
     logs: list[dict[str, Any]] = []
     seen_videos: list[str] = []
     seen_urls: set[str] = set()
-    for q in build_queries(ctx.song)[:8]:
+    for q in build_queries(ctx.song):
         urls, status = youtube_search(q, ctx.youtube_limit)
         logs.append({"channel": "youtube_search", "query": q, "status": status, "found": len(urls)})
         for u in urls:
@@ -531,7 +654,7 @@ def discover_youtube(ctx: SourceContext) -> tuple[list[Record], list[dict[str, A
             if not key or key in seen_urls:
                 continue
             seen_urls.add(key)
-            rec = handle_link(ctx.song, link, video_url, title, "youtube", ctx.out_dir)
+            rec = handle_link(ctx.song, link, video_url, title, "youtube", ctx.out_dir, ctx.profile)
             if rec:
                 records.append(rec)
         time.sleep(0.2)
@@ -543,7 +666,7 @@ def discover_bilibili(ctx: SourceContext) -> tuple[list[Record], list[dict[str, 
     logs: list[dict[str, Any]] = []
     seen_bvids: list[str] = []
     seen_urls: set[str] = set()
-    for q in build_bilibili_queries(ctx.song)[:8]:
+    for q in build_bilibili_queries(ctx.song):
         bvids, status = search_bilibili_videos(q, max_results=ctx.youtube_limit)
         logs.append({"channel": "bilibili_search", "query": q, "status": status, "found": len(bvids)})
         for bvid in bvids:
@@ -569,7 +692,7 @@ def discover_bilibili(ctx: SourceContext) -> tuple[list[Record], list[dict[str, 
             if not key or key in seen_urls:
                 continue
             seen_urls.add(key)
-            rec = handle_link(ctx.song, link, url, title, "bilibili", ctx.out_dir)
+            rec = handle_link(ctx.song, link, url, title, "bilibili", ctx.out_dir, ctx.profile)
             if rec:
                 records.append(rec)
         time.sleep(0.2)
@@ -581,7 +704,7 @@ def discover_github(ctx: SourceContext) -> tuple[list[Record], list[dict[str, An
     logs: list[dict[str, Any]] = []
     seen: set[str] = set()
     queries = []
-    for q in build_queries(ctx.song)[:4]:
+    for q in build_queries(ctx.song):
         queries.append(f"{q} site:github.com")
         queries.append(f"{q} site:gist.github.com")
     for q in queries[:ctx.web_limit * 2]:
@@ -595,7 +718,7 @@ def discover_github(ctx: SourceContext) -> tuple[list[Record], list[dict[str, An
             if not key or key in seen:
                 continue
             seen.add(key)
-            rec = handle_link(ctx.song, u, q, "", "github", ctx.out_dir)
+            rec = handle_link(ctx.song, u, q, "", "github", ctx.out_dir, ctx.profile)
             if rec:
                 records.append(rec)
         time.sleep(0.15)
@@ -614,7 +737,7 @@ def discover_web(ctx: SourceContext) -> tuple[list[Record], list[dict[str, Any]]
             if not key or key in seen:
                 continue
             seen.add(key)
-            rec = handle_link(ctx.song, u, q, "", "web", ctx.out_dir)
+            rec = handle_link(ctx.song, u, q, "", "web", ctx.out_dir, ctx.profile)
             if rec:
                 records.append(rec)
         time.sleep(0.15)
@@ -630,8 +753,11 @@ SOURCE_PLUGINS: dict[str, SourcePlugin] = {
 }
 
 
-def selected_source_names(requested: list[str], has_text: bool) -> list[str]:
-    names = requested or ["youtube", "bilibili", "github", "web"]
+def selected_source_names(requested: list[str], has_text: bool, profile: dict[str, Any]) -> list[str]:
+    preferred = [x for x in profile.get("preferred_channels", []) if x in SOURCE_PLUGINS]
+    names = requested or ordered_unique([*preferred, "pasted_text", "github", "youtube", "web", "bilibili"])
+    if not has_text:
+        names = [x for x in names if x != "pasted_text"]
     if has_text and "pasted_text" not in names:
         names = ["pasted_text", *names]
     out: list[str] = []
@@ -643,97 +769,132 @@ def selected_source_names(requested: list[str], has_text: bool) -> list[str]:
     return out
 
 
-def discover(song: Song, out_dir: Path, youtube_limit: int, max_videos: int, web_limit: int) -> tuple[list[Record], list[dict[str, Any]]]:
+def compact_evidence(item: dict[str, Any]) -> str:
+    evidence = item.get("evidence")
+    if isinstance(evidence, list):
+        return " | ".join(str(x) for x in evidence[:2])
+    if evidence:
+        return str(evidence)
+    return "; ".join(str(x) for x in item.get("reasons", []))
+
+
+def strong_record_count(records: list[Record]) -> int:
+    return sum(1 for r in records if r.status in {"downloaded", "download_candidate", "login_required_downloadable"})
+
+
+def discover(song: Song, out_dir: Path, youtube_limit: int, max_videos: int, web_limit: int, sources: list[str], text_inputs: list[str], target_profile: str, profile: dict[str, Any]) -> tuple[list[Record], list[dict[str, Any]]]:
     records: list[Record] = []
     logs: list[dict[str, Any]] = []
-    seen_videos: list[str] = []
     seen_urls: set[str] = set()
-    queries = build_queries(song)
-
-    for q in queries[:8]:
-        urls, status = youtube_search(q, youtube_limit)
-        logs.append({"channel": "youtube_search", "query": q, "status": status, "found": len(urls)})
-        for u in urls:
-            if u not in seen_videos:
-                seen_videos.append(u)
-        time.sleep(0.15)
-
-    for video_url in seen_videos[:max_videos]:
-        title, desc, links, status = extract_youtube_metadata(video_url)
-        logs.append({"channel": "youtube_video", "query": video_url, "status": status, "found": len(links), "title": title})
-        text = "\n".join([title, desc, *links])
-        # Keep score-ish external links even if YouTube only returns generic metadata.
-        if not links and not (target_matches(song, text) or GOOD_WORDS.search(text)):
+    ctx = SourceContext(song=song, out_dir=out_dir, youtube_limit=youtube_limit, max_videos=max_videos, web_limit=web_limit, target_profile=target_profile, profile=profile, text_inputs=text_inputs)
+    for source_name in sources:
+        if strong_record_count(records) >= 5:
+            logs.append({"channel": "early_stop", "query": source_name, "status": "skipped_after_5_strong_candidates", "found": len(records)})
             continue
-        for link in links:
-            link = normalize_external_url(link)
-            key = canonical_url(link)
-            if not key or key in seen_urls:
+        plugin = SOURCE_PLUGINS[source_name]
+        source_records, source_logs = plugin.discover(ctx)
+        logs.extend(source_logs)
+        for rec in source_records:
+            key = canonical_url(rec.url) or rec.url or rec.local_path
+            # Cross-source dedupe happens again after classification, but this
+            # cheap guard avoids repeated downloads/probes in a single run.
+            if key and key in seen_urls:
                 continue
-            seen_urls.add(key)
-            h = host(link)
-            if "sheet.host" in h:
-                records.append(probe_sheethost(link, video_url, title))
-            elif "drive.google.com" in h or Path(urllib.parse.urlparse(link).path).suffix.lower() in SUCCESS_EXTS:
-                records.append(try_download(song, link, video_url, title, "youtube", out_dir))
-            else:
-                records.append(classify_page(link, video_url, title, "youtube"))
-        time.sleep(0.2)
-
-    for q in queries[:web_limit]:
-        urls, status = bing_search(q, 8)
-        logs.append({"channel": "web_search", "query": q, "status": status, "found": len(urls)})
-        for u in urls:
-            u = normalize_external_url(u)
-            key = canonical_url(u)
-            if not key or key in seen_urls:
-                continue
-            seen_urls.add(key)
-            h = host(u)
-            if "sheet.host" in h:
-                records.append(probe_sheethost(u, q, ""))
-            elif "drive.google.com" in h or Path(urllib.parse.urlparse(u).path).suffix.lower() in SUCCESS_EXTS:
-                records.append(try_download(song, u, q, "", "web", out_dir))
-            else:
-                records.append(classify_page(u, q, "", "web"))
-        time.sleep(0.15)
+            if key:
+                seen_urls.add(key)
+            records.append(rec)
     return records, logs
 
 
-def dedupe_records(records: list[Record]) -> list[Record]:
-    priority = {
-        "downloaded": 100,
-        "login_required_downloadable": 80,
-        "manual_action_required": 50,
-        "page_candidate": 20,
-        "paid_or_store_excluded": 5,
-        "failed": 0,
-    }
-    best: dict[str, Record] = {}
-    for r in records:
-        key = canonical_url(r.url) or r.url or r.local_path
-        old = best.get(key)
-        if old is None or priority.get(r.status, 0) > priority.get(old.status, 0):
-            best[key] = r
-    return sorted(best.values(), key=lambda r: priority.get(r.status, 0), reverse=True)
+def load_adjudication(path: str) -> dict[str, dict[str, Any]]:
+    if not path:
+        return {}
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise SystemExit("--adjudication-json must contain a JSON array")
+    out: dict[str, dict[str, Any]] = {}
+    for item in payload:
+        if isinstance(item, dict) and item.get("candidate_id"):
+            out[str(item["candidate_id"])] = item
+    return out
 
 
-def classify_and_rank(out_dir: Path, records: list[Record]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+def render_step7_prompt(target_profile: str, profile: dict[str, Any], unknown: list[dict[str, Any]]) -> str:
+    template = (SCRIPT_DIR.parent / "templates" / "unknown_adjudication_prompt.md").read_text(encoding="utf-8")
+    return "\n\n".join([
+        template,
+        "## Target profile rubric",
+        profile_rubric_text(profile),
+        "## UNKNOWN candidates",
+        json.dumps(unknown, ensure_ascii=False, indent=2),
+    ])
+
+
+def apply_step7(classified: list[dict[str, Any]], target_profile: str, profile: dict[str, Any], unknown_policy: str, adjudication_json: str = "") -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Resolve UNKNOWN candidates after deterministic classification.
+
+    If an adjudication JSON is provided, merge it by candidate_id. Otherwise the
+    default conservative policy assigns UNKNOWN candidates to page_candidate so
+    terminal reports have an explicit non-download action instead of a dangling
+    runtime AI requirement.
+    """
+    original_unknown = [x for x in classified if x.get("needs_ai")]
+    decisions = load_adjudication(adjudication_json)
+    resolved: list[dict[str, Any]] = []
+    for item in classified:
+        item = dict(item)
+        cid = str(item.get("candidate_id", ""))
+        decision = decisions.get(cid)
+        if decision:
+            status = normalize_status(decision.get("status"), default="UNKNOWN")
+            item["status"] = status
+            item["match"] = decision.get("match") if isinstance(decision.get("match"), dict) else {target_profile: decision.get("match", "UNKNOWN")}
+            item.setdefault("reasons", [])
+            item["reasons"] = [*item.get("reasons", []), "step7 adjudication: " + str(decision.get("reason", ""))]
+            item["needs_ai"] = item["status"] == "UNKNOWN" or "UNKNOWN" in [str(v) for v in item.get("match", {}).values()]
+        elif item.get("needs_ai") and unknown_policy == "conservative":
+            if item.get("status") not in {"login_required_downloadable", "manual_action_required", "private_gate", "paid_or_store_excluded", "failed"}:
+                item["status"] = "page_candidate"
+            item["match"] = {target_profile: "UNKNOWN"}
+            item["score"] = min(int(item.get("score") or 0), 40)
+            item["reasons"] = [*item.get("reasons", []), "step7 conservative fallback: keep as page_candidate, do not download"]
+            item["needs_ai"] = False
+        resolved.append(item)
+    unresolved = [x for x in resolved if x.get("needs_ai")]
+    step7_decisions = [
+        {
+            "candidate_id": x.get("candidate_id"),
+            "status": x.get("status"),
+            "match": x.get("match"),
+            "reasons": x.get("reasons", [])[-2:],
+        }
+        for x in resolved
+        if x.get("candidate_id") in {u.get("candidate_id") for u in original_unknown}
+    ]
+    return resolved, original_unknown if unknown_policy != "keep" or decisions else unresolved, step7_decisions
+
+
+def classify_and_rank(out_dir: Path, records: list[Record], target_profile: str, profile: dict[str, Any], unknown_policy: str, adjudication_json: str = "") -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     out_dir.mkdir(parents=True, exist_ok=True)
     raw = [asdict(r) for r in records]
     for item in raw:
         item["status"] = normalize_status(item.get("status"))
     (out_dir / "raw_candidates.json").write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
     classified = [classify_candidate(item, i) for i, item in enumerate(raw, 1)]
+    original_unknown_preview = [x for x in classified if x.get("needs_ai")]
+    (out_dir / "STEP7_PROMPT.md").write_text(render_step7_prompt(target_profile, profile, original_unknown_preview), encoding="utf-8")
+    classified, original_unknown, step7_decisions = apply_step7(classified, target_profile, profile, unknown_policy, adjudication_json)
     unknown = [x for x in classified if x.get("needs_ai")]
     ranked = dedupe_candidates(classified)
     (out_dir / "classified.json").write_text(json.dumps(classified, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "unknown_candidates.original.json").write_text(json.dumps(original_unknown, ensure_ascii=False, indent=2), encoding="utf-8")
     (out_dir / "unknown_candidates.json").write_text(json.dumps(unknown, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "STEP7_DECISIONS.json").write_text(json.dumps(step7_decisions, ensure_ascii=False, indent=2), encoding="utf-8")
     (out_dir / "ranked.json").write_text(json.dumps(ranked, ensure_ascii=False, indent=2), encoding="utf-8")
-    return raw, classified, unknown, ranked
+    return raw, classified, unknown, ranked, step7_decisions
 
 
-def write_outputs(song: Song, out_dir: Path, ranked: list[dict[str, Any]], unknown: list[dict[str, Any]], logs: list[dict[str, Any]]) -> dict[str, Any]:
+def write_outputs(song: Song, out_dir: Path, ranked: list[dict[str, Any]], unknown: list[dict[str, Any]], logs: list[dict[str, Any]], target_profile: str, step7_decisions: list[dict[str, Any]]) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     downloaded = [r for r in ranked if r.get("status") == "downloaded" and r.get("local_path")]
     login_required = [
@@ -754,9 +915,11 @@ def write_outputs(song: Song, out_dir: Path, ranked: list[dict[str, Any]], unkno
     failures = [r for r in ranked if r.get("status") == "failed"]
     result = {
         "song": asdict(song),
+        "target_profile": target_profile,
         "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "result_contract": "Either downloaded_files contains local complete-score artifacts, or login_required_downloadables lists pages with visible downloadable score files requiring normal login/platform flow.",
         "unknown_candidates": unknown,
+        "step7_decisions": step7_decisions,
         "downloaded_files": downloaded,
         "login_required_downloadables": login_required,
         "score_platform_candidates": score_platform,
@@ -768,11 +931,15 @@ def write_outputs(song: Song, out_dir: Path, ranked: list[dict[str, Any]], unkno
     }
     (out_dir / "RESULT.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    lines = [f"# Piano Score Result: {song.title}", "", f"- Artist: {song.artist}", f"- Output: `{out_dir}`", ""]
+    lines = [f"# Piano Score Result: {song.title}", "", f"- Artist: {song.artist}", f"- Target profile: `{target_profile}`", f"- Output: `{out_dir}`", ""]
     lines += ["## Downloaded files", ""]
     if downloaded:
         for r in downloaded:
-            lines += [f"- `{r.get('local_path')}`", f"  - kind: {r.get('file_kind')}; bytes: {r.get('bytes')}; sha256: `{r.get('sha256')}`", f"  - source: {r.get('source_url')}", ""]
+            lines += [f"- `{r.get('local_path')}`", f"  - kind: {r.get('file_kind')}; bytes: {r.get('bytes')}; sha256: `{r.get('sha256')}`", f"  - source: {r.get('source_url')}"]
+            if r.get("archive_files"):
+                for f in r.get("archive_files", []):
+                    lines.append(f"  - archive file: `{f.get('name')}` -> `{f.get('local_path', '')}` ({f.get('status')})")
+            lines.append("")
     else:
         lines.append("- none")
         lines.append("")
@@ -794,7 +961,7 @@ def write_outputs(song: Song, out_dir: Path, ranked: list[dict[str, Any]], unkno
     lines += ["## Score platform candidates", ""]
     if score_platform:
         for r in score_platform[:20]:
-            lines += [f"- {r.get('url')}", f"  - reason: {r.get('evidence') or '; '.join(str(x) for x in r.get('reasons', []))}", f"  - source: {r.get('source_url')}", ""]
+            lines += [f"- {r.get('url')}", f"  - reason: {compact_evidence(r)}", f"  - source: {r.get('source_url')}", ""]
     else:
         lines.append("- none")
         lines.append("")
@@ -802,7 +969,7 @@ def write_outputs(song: Song, out_dir: Path, ranked: list[dict[str, Any]], unkno
     lines += ["## Manual action / non-direct candidates", ""]
     if manual:
         for r in manual[:20]:
-            lines += [f"- {r.get('url')}", f"  - reason: {r.get('evidence') or r.get('classification')}", f"  - source: {r.get('source_url')}", ""]
+            lines += [f"- {r.get('url')}", f"  - reason: {compact_evidence(r) or r.get('classification')}", f"  - source: {r.get('source_url')}", ""]
     else:
         lines.append("- none")
         lines.append("")
@@ -819,9 +986,9 @@ def write_outputs(song: Song, out_dir: Path, ranked: list[dict[str, Any]], unkno
 
     lines += ["## Unknown candidates", ""]
     if unknown:
-        lines.append(f"- {len(unknown)} candidates require optional step7 adjudication. See `unknown_candidates.json`.")
+        lines.append(f"- {len(unknown)} candidates still require adjudication. See `unknown_candidates.json`.")
     else:
-        lines.append("- none")
+        lines.append("- none; step7 produced explicit fallback/adjudication decisions where needed.")
     lines.append("")
 
     lines += ["## Search log", ""]
@@ -837,21 +1004,40 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--artist", default="")
     ap.add_argument("--alias", action="append", default=[])
     ap.add_argument("--out", default="sheet-music")
-    ap.add_argument("--youtube-limit", type=int, default=12, help="Videos per YouTube query")
-    ap.add_argument("--max-videos", type=int, default=48, help="Max unique YouTube videos to inspect")
-    ap.add_argument("--web-limit", type=int, default=4, help="Number of web queries to run")
+    ap.add_argument("--youtube-limit", type=int, default=18, help="Videos per YouTube query")
+    ap.add_argument("--max-videos", type=int, default=100, help="Max unique YouTube/Bilibili videos to inspect")
+    ap.add_argument("--web-limit", type=int, default=8, help="Number of web queries to run")
+    ap.add_argument("--profile", choices=profile_names(), default="piano_score", help="Target profile loaded from profiles/*.yaml.")
+    ap.add_argument("--unknown-policy", choices=["conservative", "keep"], default="conservative", help="Step7 fallback when no adjudication JSON is supplied.")
+    ap.add_argument("--adjudication-json", default="", help="Optional JSON array of step7 AI/adjudicator decisions to merge by candidate_id.")
+    ap.add_argument("--source", action="append", choices=sorted(SOURCE_PLUGINS), help="Source plugin to run. Repeatable. Default: youtube,bilibili,github,web; pasted_text is added when text is supplied.")
+    ap.add_argument("--text", action="append", default=[], help="Public description/comment text to parse as a P0 source.")
+    ap.add_argument("--text-file", action="append", default=[], help="UTF-8 text file containing public description/comment text to parse as a P0 source.")
     args = ap.parse_args(argv)
 
     title = args.song.strip()
     artist = args.artist.strip()
     aliases = ordered_unique([*load_known_aliases(title, artist), *[a.strip() for a in args.alias if a.strip()]])
     song = Song(title, artist, aliases)
-    root = Path(args.out) / song.id
-    records, logs = discover(song, root, args.youtube_limit, args.max_videos, args.web_limit)
-    _raw, _classified, unknown, ranked = classify_and_rank(root, records)
-    result = write_outputs(song, root, ranked, unknown, logs)
+    profile = load_profile(args.profile)
+    root_name = song.id if args.profile == "piano_score" else f"{song.id}-{args.profile}"
+    root = Path(args.out) / root_name
+    text_inputs = [str(x) for x in args.text if str(x).strip()]
+    for path in args.text_file:
+        try:
+            text_inputs.append(Path(path).read_text(encoding="utf-8"))
+        except Exception as e:
+            text_inputs.append(f"[failed to read {path}: {type(e).__name__}: {e}]")
+    sources = selected_source_names(args.source or [], bool(text_inputs), profile)
+    records, logs = discover(song, root, args.youtube_limit, args.max_videos, args.web_limit, sources, text_inputs, args.profile, profile)
+    _raw, _classified, unknown, ranked, step7_decisions = classify_and_rank(root, records, args.profile, profile, args.unknown_policy, args.adjudication_json)
+    result = write_outputs(song, root, ranked, unknown, logs, args.profile, step7_decisions)
+    result["sources"] = sources
+    (root / "RESULT.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(root / "RESULT.md")
     print(json.dumps({
+        "sources": sources,
+        "target_profile": args.profile,
         "downloaded_files": len(result["downloaded_files"]),
         "login_required_downloadables": len(result["login_required_downloadables"]),
         "manual_action_required": len(result["manual_action_required"]),

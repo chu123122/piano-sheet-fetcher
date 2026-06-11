@@ -44,7 +44,7 @@ python .\scripts\find_piano_scores.py "ただ君に晴れ" --artist "Yorushika" 
 - 下载成功前会检查文件签名/扩展名，避免把网页或 `.bin` 冒充成谱；
 - 输出 Markdown 报告和 JSON 中间产物；
 - 区分已下载、可下载但需登录、需要人工动作、付费/商店排除、私信/进群门槛、MIDI-only、非完整谱、未知候选等情况。
-- 用 `profiles/<profile>.yaml` 的 rubric 决定候选对目标 profile 是否成功；脚本分类器只做硬门控和粗筛。
+- 用 `profiles/<profile>.yaml` 的 `success_formats` / `auxiliary_formats` 做格式级确定性判断；只有页面语义/证据冲突进入一次性 step7 裁决。
 
 成功格式包括：
 
@@ -65,7 +65,10 @@ sheet-music/
     RESULT.json
     raw_candidates.json
     classified.json
+    unknown_candidates.original.json
+    STEP7_PROMPT.md
     unknown_candidates.json
+    STEP7_DECISIONS.json
     ranked.json
     downloads/
       title-source.pdf
@@ -78,7 +81,9 @@ sheet-music/
 - `RESULT.json`：完整结构化结果；
 - `raw_candidates.json`：原始候选；
 - `classified.json`：确定性分类后的候选；
-- `unknown_candidates.json`：需要 AI 或人工裁决的小批量候选；
+- `unknown_candidates.original.json`：确定性分类后仍需 step7 的原始小批量候选；
+- `STEP7_PROMPT.md` / `STEP7_DECISIONS.json`：rubric 裁决提示和合并后的裁决留痕；
+- `unknown_candidates.json`：保守兜底或裁决后仍未解决的候选；
 - `ranked.json`：去重排序后的候选；
 - `downloads/`：实际下载到本地的谱文件和来源 metadata。
 
@@ -120,7 +125,7 @@ sheet-music/
 ## 主要脚本
 
 - `scripts/find_piano_scores.py`：产品入口；
-- `scripts/classify_candidates.py`：确定性候选分类；
+- `scripts/classify_candidates.py`：硬门控 + 读取 profile yaml 的格式级确定性分类；
 - `scripts/dedupe_candidates.py`：去重、排序、报告辅助；
 - `scripts/fetch_sheet.py`：公开直链下载器；
 - `scripts/bilibili_full_score_hunt.py`：B站 source probe，只抽取证据，不做最终分类；

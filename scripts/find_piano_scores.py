@@ -42,6 +42,7 @@ from bilibili_full_score_hunt import (  # noqa: E402
 from status_enum import normalize_status  # noqa: E402
 from profile_utils import (  # noqa: E402
     load_profile,
+    profile_auxiliary_formats,
     profile_names,
     profile_rubric_text,
     profile_target_kinds,
@@ -481,9 +482,9 @@ def try_download(song: Song, url: str, source_url: str, source_title: str, chann
             rec.status = "manual_action_required"
             rec.classification = "non_direct_or_untrusted_artifact"
             rec.file_kind = kind
-            if kind == "midi" and profile.get("profile") == "piano_score":
-                rec.status = "midi_only_auxiliary"
-                rec.classification = "midi_only"
+            if kind in profile_auxiliary_formats(profile):
+                rec.status = "midi_only_auxiliary" if kind in {"mid", "midi"} else "page_candidate"
+                rec.classification = "auxiliary_only"
             rec.evidence = f"HTTP {status}; content-type={ctype}; file signature={kind}; target_profile={profile.get('profile', '')}; not counted as target success."
             return rec
         path, sha = write_artifact(song, data, final, source_url, out_dir, channel, kind)
@@ -880,7 +881,7 @@ def classify_and_rank(out_dir: Path, records: list[Record], target_profile: str,
     for item in raw:
         item["status"] = normalize_status(item.get("status"))
     (out_dir / "raw_candidates.json").write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
-    classified = [classify_candidate(item, i) for i, item in enumerate(raw, 1)]
+    classified = [classify_candidate(item, i, target_profile, profile) for i, item in enumerate(raw, 1)]
     original_unknown_preview = [x for x in classified if x.get("needs_ai")]
     (out_dir / "STEP7_PROMPT.md").write_text(render_step7_prompt(target_profile, profile, original_unknown_preview), encoding="utf-8")
     classified, original_unknown, step7_decisions = apply_step7(classified, target_profile, profile, unknown_policy, adjudication_json)

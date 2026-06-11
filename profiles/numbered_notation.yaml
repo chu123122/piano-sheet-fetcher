@@ -3,5 +3,6 @@ success: "简谱/数字谱：图片、PDF、网页文本明确是数字谱或简
 auxiliary: "MIDI、五线谱、完整钢琴谱可作辅助线索。"
 exclude: "纯瀑布流、纯演奏视频、无谱面内容、与曲名不匹配。"
 success_formats: [pdf, jpg, png, html]
+auxiliary_formats: [mid, midi, mscz, mxl, musicxml]
 extra_paid_domains: []
 preferred_channels: [bilibili, web, youtube]

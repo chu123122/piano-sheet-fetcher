@@ -52,9 +52,9 @@ Runtime default:
    - Gate mapping does not call AI.
 
 6. **Candidate classification — script**
-   - Use `scripts/classify_candidates.py`.
-   - This classifier is profile-agnostic. It handles hard gates and coarse file/page shape only.
-   - It must not decide whether a candidate is success for a selected target profile; that belongs to step7 rubric.
+   - Use `scripts/classify_candidates.py --profile <profile>`.
+   - This classifier is profile-configured, not profile-hardcoded: it first handles hard gates, then reads `profiles/<profile>.yaml` `success_formats` / `auxiliary_formats` for deterministic format-level judgement.
+   - It must not contain profile-name semantic branches. Ambiguous page/text/content conflicts stay `needs_ai=true` for step7 rubric.
    - Output contract per candidate:
 
 ```json
@@ -62,7 +62,7 @@ Runtime default:
   "candidate_id": "...",
   "status": "downloaded|download_candidate|login_required_downloadable|manual_action_required|paid_or_store_excluded|private_gate|not_full_piano_score|midi_only_auxiliary|page_candidate|UNKNOWN|failed",
   "score": 0,
-  "match": {"rubric": "UNKNOWN"},
+  "match": {"<target_profile>": "success|auxiliary|exclude|UNKNOWN"},
   "reasons": ["..."],
   "evidence": ["原文片段"],
   "needs_ai": false
@@ -75,7 +75,7 @@ Runtime default:
    - To use an AI/human adjudication result, pass `--adjudication-json <decisions.json>`; decisions are merged by `candidate_id`.
    - Use `templates/unknown_adjudication_prompt.md`.
    - AI returns JSON only; scripts consume the result.
-   - Do not send already deterministic paid/login/private/direct cases to AI.
+   - Do not send already deterministic paid/private/failed cases or explicit-format decisions to AI. Login/manual candidates with explicit target-profile files stay deterministic; login/manual candidates without explicit formats may go to step7.
 
 8. **Dedupe + ranking — script**
    - Use `scripts/dedupe_candidates.py`.
@@ -155,7 +155,7 @@ python path\to\piano-sheet-fetcher\scripts\bilibili_full_score_hunt.py "<song-ti
 Classify + isolate AI batch:
 
 ```powershell
-python path\to\piano-sheet-fetcher\scripts\classify_candidates.py ".\candidates.json" --out ".\classified.json" --unknown-out ".\unknown_candidates.json"
+python path\to\piano-sheet-fetcher\scripts\classify_candidates.py ".\candidates.json" --profile piano_score --out ".\classified.json" --unknown-out ".\unknown_candidates.json"
 ```
 
 Dedupe + report:
@@ -181,7 +181,7 @@ python path\to\piano-sheet-fetcher\scripts\organize_local_score.py ".\Downloads\
 - Multi-channel search is now the default implementation direction. The product entrypoint uses registered source plugins: `pasted_text`, `youtube`, `bilibili`, `github`, `web`.
 - Bilibili-only mode is a scoped mode, not the general product direction.
 - New sources should be added as source plugins, not as more `if/elif` inside the core classifier.
-- Profile success/exclusion semantics live in `profiles/*.yaml`, not in `classify_candidates.py`.
+- Profile success/auxiliary format lists and rubric text live in `profiles/*.yaml`, not in `classify_candidates.py`.
 - Prefer creator/uploader-posted links and visible public description/comment text.
 - Skip paid stores and membership-only resources as downloads; record them as exclusions.
 - SheetHost pages that list PDF/MID but route through login are `login_required_downloadable`.

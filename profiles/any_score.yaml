@@ -3,5 +3,6 @@ success: "任意曲谱：五线谱、简谱、Tab、MIDI、MusicXML、MSCZ、PDF
 auxiliary: "纯演奏/教程视频只能作线索。"
 exclude: "无谱面或文件证据、纯音频、纯视频、与曲名不匹配。"
 success_formats: [pdf, mscz, mxl, musicxml, mid, midi, jpg, png, gp, gp3, gp4, gp5, gpx, html, zip]
+auxiliary_formats: []
 extra_paid_domains: []
 preferred_channels: [github, youtube, web, bilibili]

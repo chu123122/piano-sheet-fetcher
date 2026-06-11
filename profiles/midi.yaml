@@ -3,5 +3,6 @@ success: "MIDI：MID/MIDI 文件，或明确包含 MIDI 的可下载谱包。"
 auxiliary: "PDF、MSCZ、MXL、MusicXML 可作辅助线索，因为可能能转换成 MIDI。"
 exclude: "纯视频、纯瀑布流展示、无文件链接、与曲名不匹配。"
 success_formats: [mid, midi, zip]
+auxiliary_formats: [pdf, mscz, mxl, musicxml]
 extra_paid_domains: []
 preferred_channels: [github, youtube, web, bilibili]

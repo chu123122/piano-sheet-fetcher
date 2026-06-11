@@ -179,6 +179,8 @@ python path\to\piano-sheet-fetcher\scripts\organize_local_score.py ".\Downloads\
 ## Search Rules
 
 - Multi-channel search is now the default implementation direction. The product entrypoint uses registered source plugins: `pasted_text`, `youtube`, `bilibili`, `github`, `web`.
+- Default recall is intentionally wide: `youtube-limit=20`, `max-videos=100`, `web-limit=0` (all generated web/GitHub queries), Bing top-K 20. Use early stop, not low defaults, to control cost.
+- Fast/actionable sources run first (`pasted_text`, `github`), then video/web sources. Each source stops after about 5 strong candidates (`downloaded`, `download_candidate`, `login_required_downloadable`).
 - Bilibili-only mode is a scoped mode, not the general product direction.
 - New sources should be added as source plugins, not as more `if/elif` inside the core classifier.
 - Profile success/auxiliary format lists and rubric text live in `profiles/*.yaml`, not in `classify_candidates.py`.

@@ -56,6 +56,24 @@ python .\scripts\find_piano_scores.py "ただ君に晴れ" --artist "Yorushika" 
 
 MIDI-only 在“完整钢琴谱”目标下只算辅助线索，不算成功。
 
+
+## 默认召回策略
+
+当前默认偏“尽量找全”，不再靠低 limit 控成本：
+
+- `--youtube-limit 20`：每个 YouTube / B站 query 取前 20；
+- `--max-videos 100`：每首最多探测 100 个唯一视频；
+- `--web-limit 0`：Web/GitHub query 不截断，`0` 表示跑完别名 × 模板去重后的全部 query；
+- Web/GitHub 每 query top-K 为 20；
+- 快渠道优先：`pasted_text` / `github` 先于 YouTube/Web/B站；
+- 每个渠道内攒够约 5 个 `downloaded` / `download_candidate` / `login_required_downloadable` 强候选即早停，后续渠道也会跳过。
+
+如果遇到限频或只想快速 smoke，可手动压低：
+
+```powershell
+python .\scripts\find_piano_scores.py "<song-title>" --youtube-limit 8 --max-videos 24 --web-limit 4 --out ".\sheet-music"
+```
+
 ## 输出结构
 
 ```text

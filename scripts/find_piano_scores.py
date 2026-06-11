@@ -66,6 +66,8 @@ KEEP_HOST_HINTS = [
     "mymusicsheet", "mymusic.st", "kokomu", "piascore", "booth.pm",
 ]
 KNOWN_ALIASES_PATH = SCRIPT_DIR.parent / "references" / "known_aliases.json"
+STRONG_CANDIDATE_TARGET = 5
+WEB_TOP_K = 20
 
 
 @dataclass
@@ -643,6 +645,12 @@ def discover_pasted_text(ctx: SourceContext) -> tuple[list[Record], list[dict[st
     return records, logs
 
 
+def limited_query_list(queries: list[str], web_limit: int, multiplier: int = 1) -> list[str]:
+    if web_limit <= 0:
+        return queries
+    return queries[:max(web_limit * multiplier, 0)]
+
+
 def discover_youtube(ctx: SourceContext) -> tuple[list[Record], list[dict[str, Any]]]:
     records: list[Record] = []
     logs: list[dict[str, Any]] = []
@@ -657,6 +665,9 @@ def discover_youtube(ctx: SourceContext) -> tuple[list[Record], list[dict[str, A
         time.sleep(0.15)
 
     for video_url in seen_videos[:ctx.max_videos]:
+        if strong_record_count(records) >= STRONG_CANDIDATE_TARGET:
+            logs.append({"channel": "youtube_early_stop", "query": video_url, "status": f"stopped_after_{STRONG_CANDIDATE_TARGET}_strong_candidates", "found": len(records)})
+            break
         title, desc, links, status = extract_youtube_metadata(video_url)
         logs.append({"channel": "youtube_video", "query": video_url, "status": status, "found": len(links), "title": title})
         text = "\n".join([title, desc, *links])
@@ -670,6 +681,8 @@ def discover_youtube(ctx: SourceContext) -> tuple[list[Record], list[dict[str, A
             rec = handle_link(ctx.song, link, video_url, title, "youtube", ctx.out_dir, ctx.profile)
             if rec:
                 records.append(rec)
+                if strong_record_count(records) >= STRONG_CANDIDATE_TARGET:
+                    break
         time.sleep(0.2)
     return records, logs
 
@@ -687,6 +700,9 @@ def discover_bilibili(ctx: SourceContext) -> tuple[list[Record], list[dict[str, 
                 seen_bvids.append(bvid)
         time.sleep(0.15)
     for bvid in seen_bvids[:ctx.max_videos]:
+        if strong_record_count(records) >= STRONG_CANDIDATE_TARGET:
+            logs.append({"channel": "bilibili_early_stop", "query": bvid, "status": f"stopped_after_{STRONG_CANDIDATE_TARGET}_strong_candidates", "found": len(records)})
+            break
         url = bilibili_video_url(bvid)
         try:
             _status, _final, raw = text_request(url)
@@ -708,6 +724,8 @@ def discover_bilibili(ctx: SourceContext) -> tuple[list[Record], list[dict[str, 
             rec = handle_link(ctx.song, link, url, title, "bilibili", ctx.out_dir, ctx.profile)
             if rec:
                 records.append(rec)
+                if strong_record_count(records) >= STRONG_CANDIDATE_TARGET:
+                    break
         time.sleep(0.2)
     return records, logs
 
@@ -720,8 +738,11 @@ def discover_github(ctx: SourceContext) -> tuple[list[Record], list[dict[str, An
     for q in build_queries(ctx.song, ctx.profile):
         queries.append(f"{q} site:github.com")
         queries.append(f"{q} site:gist.github.com")
-    for q in queries[:ctx.web_limit * 2]:
-        urls, status = bing_search(q, 8)
+    for q in limited_query_list(queries, ctx.web_limit, multiplier=2):
+        if strong_record_count(records) >= STRONG_CANDIDATE_TARGET:
+            logs.append({"channel": "github_early_stop", "query": q, "status": f"stopped_after_{STRONG_CANDIDATE_TARGET}_strong_candidates", "found": len(records)})
+            break
+        urls, status = bing_search(q, WEB_TOP_K)
         logs.append({"channel": "github_search", "query": q, "status": status, "found": len(urls)})
         for u in urls:
             h = host(u)
@@ -734,6 +755,8 @@ def discover_github(ctx: SourceContext) -> tuple[list[Record], list[dict[str, An
             rec = handle_link(ctx.song, u, q, "", "github", ctx.out_dir, ctx.profile)
             if rec:
                 records.append(rec)
+                if strong_record_count(records) >= STRONG_CANDIDATE_TARGET:
+                    break
         time.sleep(0.15)
     return records, logs
 
@@ -742,8 +765,11 @@ def discover_web(ctx: SourceContext) -> tuple[list[Record], list[dict[str, Any]]
     records: list[Record] = []
     logs: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for q in build_queries(ctx.song, ctx.profile)[:ctx.web_limit]:
-        urls, status = bing_search(q, 8)
+    for q in limited_query_list(build_queries(ctx.song, ctx.profile), ctx.web_limit):
+        if strong_record_count(records) >= STRONG_CANDIDATE_TARGET:
+            logs.append({"channel": "web_early_stop", "query": q, "status": f"stopped_after_{STRONG_CANDIDATE_TARGET}_strong_candidates", "found": len(records)})
+            break
+        urls, status = bing_search(q, WEB_TOP_K)
         logs.append({"channel": "web_search", "query": q, "status": status, "found": len(urls)})
         for u in urls:
             key = canonical_url(u)
@@ -753,6 +779,8 @@ def discover_web(ctx: SourceContext) -> tuple[list[Record], list[dict[str, Any]]
             rec = handle_link(ctx.song, u, q, "", "web", ctx.out_dir, ctx.profile)
             if rec:
                 records.append(rec)
+                if strong_record_count(records) >= STRONG_CANDIDATE_TARGET:
+                    break
         time.sleep(0.15)
     return records, logs
 
@@ -768,7 +796,9 @@ SOURCE_PLUGINS: dict[str, SourcePlugin] = {
 
 def selected_source_names(requested: list[str], has_text: bool, profile: dict[str, Any]) -> list[str]:
     preferred = [x for x in profile.get("preferred_channels", []) if x in SOURCE_PLUGINS]
-    names = requested or ordered_unique([*preferred, "pasted_text", "github", "youtube", "web", "bilibili"])
+    # Fast/actionable sources first; profile preferences are still honored after
+    # pasted text and GitHub so slow video scraping cannot block quick hits.
+    names = requested or ordered_unique(["pasted_text", "github", *preferred, "youtube", "web", "bilibili"])
     if not has_text:
         names = [x for x in names if x != "pasted_text"]
     if has_text and "pasted_text" not in names:
@@ -801,8 +831,8 @@ def discover(song: Song, out_dir: Path, youtube_limit: int, max_videos: int, web
     seen_urls: set[str] = set()
     ctx = SourceContext(song=song, out_dir=out_dir, youtube_limit=youtube_limit, max_videos=max_videos, web_limit=web_limit, target_profile=target_profile, profile=profile, text_inputs=text_inputs)
     for source_name in sources:
-        if strong_record_count(records) >= 5:
-            logs.append({"channel": "early_stop", "query": source_name, "status": "skipped_after_5_strong_candidates", "found": len(records)})
+        if strong_record_count(records) >= STRONG_CANDIDATE_TARGET:
+            logs.append({"channel": "early_stop", "query": source_name, "status": f"skipped_after_{STRONG_CANDIDATE_TARGET}_strong_candidates", "found": len(records)})
             continue
         plugin = SOURCE_PLUGINS[source_name]
         source_records, source_logs = plugin.discover(ctx)
@@ -1017,13 +1047,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--artist", default="")
     ap.add_argument("--alias", action="append", default=[])
     ap.add_argument("--out", default="sheet-music")
-    ap.add_argument("--youtube-limit", type=int, default=18, help="Videos per YouTube query")
+    ap.add_argument("--youtube-limit", type=int, default=20, help="Videos per YouTube/Bilibili query")
     ap.add_argument("--max-videos", type=int, default=100, help="Max unique YouTube/Bilibili videos to inspect")
-    ap.add_argument("--web-limit", type=int, default=8, help="Number of web queries to run")
+    ap.add_argument("--web-limit", type=int, default=0, help="Number of web/GitHub queries to run; 0 means all generated queries")
     ap.add_argument("--profile", choices=profile_names(), default="piano_score", help="Target profile loaded from profiles/*.yaml.")
     ap.add_argument("--unknown-policy", choices=["conservative", "keep"], default="conservative", help="Step7 fallback when no adjudication JSON is supplied.")
     ap.add_argument("--adjudication-json", default="", help="Optional JSON array of step7 AI/adjudicator decisions to merge by candidate_id.")
-    ap.add_argument("--source", action="append", choices=sorted(SOURCE_PLUGINS), help="Source plugin to run. Repeatable. Default: youtube,bilibili,github,web; pasted_text is added when text is supplied.")
+    ap.add_argument("--source", action="append", choices=sorted(SOURCE_PLUGINS), help="Source plugin to run. Repeatable. Default: github,youtube,web,bilibili; pasted_text is prepended when text is supplied.")
     ap.add_argument("--text", action="append", default=[], help="Public description/comment text to parse as a P0 source.")
     ap.add_argument("--text-file", action="append", default=[], help="UTF-8 text file containing public description/comment text to parse as a P0 source.")
     args = ap.parse_args(argv)

@@ -47,6 +47,7 @@ def load_profile(name: str) -> dict[str, Any]:
     data.setdefault("auxiliary_formats", [])
     data.setdefault("extra_paid_domains", [])
     data.setdefault("preferred_channels", [])
+    data.setdefault("search_terms", [])
     return data
 
 
@@ -100,5 +101,6 @@ def profile_rubric_text(profile: dict[str, Any]) -> str:
         "success_formats: " + ", ".join(profile.get("success_formats", [])),
         "auxiliary_formats: " + ", ".join(profile.get("auxiliary_formats", [])),
         "preferred_channels: " + ", ".join(profile.get("preferred_channels", [])),
+        "search_terms: " + ", ".join(profile.get("search_terms", [])),
     ]
     return "\n".join(lines)

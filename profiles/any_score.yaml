@@ -6,3 +6,4 @@ success_formats: [pdf, mscz, mxl, musicxml, mid, midi, jpg, png, gp, gp3, gp4, g
 auxiliary_formats: []
 extra_paid_domains: []
 preferred_channels: [github, youtube, web, bilibili]
+search_terms: [sheet music, score, pdf, midi]

@@ -101,28 +101,34 @@ def _format_from_name(value: object) -> str:
 def explicit_formats(item: dict[str, Any]) -> list[str]:
     """Return explicit file formats only, not loose text mentions.
 
-    Explicit means a typed field, visible file name/kind, URL path suffix, or a
-    structured link kind/URL suffix. Free-form evidence like "I mention PDF" is
-    intentionally ignored and left to step7.
+    Explicit means a trusted typed field, visible file name/kind, URL path
+    suffix, or structured link kind/URL suffix. If an upstream probe already
+    inspected a URL and produced file_kind=unknown, URL suffixes are treated as
+    misleading page shape and not as file-format evidence.
     """
     formats: list[str] = []
 
     def add(fmt: object) -> None:
         normalized = normalize_format(fmt)
-        if normalized and normalized not in formats:
+        if normalized and normalized != "unknown" and normalized not in formats:
             formats.append(normalized)
 
-    for key in ["file_kind", "format"]:
-        val = item.get(key)
-        if isinstance(val, str):
-            fmt = _format_from_name(val)
-            if fmt:
-                add(fmt)
-
-    for key in ["file_name", "url", "source_url"]:
-        fmt = _format_from_name(item.get(key))
+    probed_unknown = str(item.get("file_kind") or "").lower().strip() == "unknown"
+    if isinstance(item.get("file_kind"), str) and not probed_unknown:
+        fmt = _format_from_name(item.get("file_kind"))
         if fmt:
             add(fmt)
+
+    if isinstance(item.get("format"), str):
+        fmt = _format_from_name(item.get("format"))
+        if fmt:
+            add(fmt)
+
+    if not probed_unknown:
+        for key in ["file_name", "url", "source_url"]:
+            fmt = _format_from_name(item.get(key))
+            if fmt:
+                add(fmt)
 
     for f in item.get("visible_files", []) if isinstance(item.get("visible_files"), list) else []:
         if not isinstance(f, dict):
@@ -162,12 +168,14 @@ def is_login_or_manual_status(status: str) -> bool:
 
 def status_for_format_match(match: str, fmt: str, incoming_status: str, item: dict[str, Any], text: str, url: str) -> tuple[str, int, str]:
     if match == "success":
-        if incoming_status in {"downloaded", "download_success"} or item.get("local_path"):
+        if incoming_status in {"downloaded", "download_success"}:
             return "downloaded", 100, f"explicit target format {fmt}; already downloaded/validated upstream"
-        if incoming_status in {"login_required_downloadable", "visible_score_files"} or LOGIN_RE.search(text):
+        if incoming_status in {"login_required_downloadable", "visible_score_files"}:
             return "login_required_downloadable", 75, f"explicit target format {fmt} behind normal login/platform flow"
         if incoming_status in {"manual_action_required", "manual_download_candidate", "cloud_folder_or_unknown"} or (CLOUD_HOST_RE.search(url) and not DIRECT_HOST_RE.search(url)):
             return "manual_action_required", 45, f"explicit target format {fmt} requires manual/browser/client action"
+        if LOGIN_RE.search(text):
+            return "login_required_downloadable", 75, f"explicit target format {fmt} behind normal login/platform flow"
         return "download_candidate", 70, f"explicit target format {fmt}"
     if match == "auxiliary":
         status = "midi_only_auxiliary" if fmt in AUXILIARY_STATUS_FORMATS else "page_candidate"
@@ -195,7 +203,9 @@ def classify(item: dict[str, Any], index: int, target_profile: str = "piano_scor
     has_platform = bool(SCORE_PLATFORM_RE.search(url))
     formats = explicit_formats(item)
 
-    if incoming_status in TERMINAL_STATUS_MAP:
+    if incoming_status == "manual_action_required" and str(item.get("classification") or "") == "archive_no_target_files":
+        status = "not_full_piano_score"; score = 10; needs_ai = False; match_value = "exclude"; reasons.append("inspected archive contains no target-profile files")
+    elif incoming_status in TERMINAL_STATUS_MAP:
         status, score, reason, needs_ai, match_value = TERMINAL_STATUS_MAP[incoming_status]
         reasons.append(reason)
     elif has_paid:
@@ -212,7 +222,8 @@ def classify(item: dict[str, Any], index: int, target_profile: str = "piano_scor
         # conflict; step7/user should inspect before counting it as target.
         status = "UNKNOWN"; score = 60; needs_ai = True; match_value = "UNKNOWN"; reasons.append("downloaded-like status without explicit target format")
     elif is_login_or_manual_status(incoming_status) or (has_cloud and not has_direct):
-        status = "manual_action_required" if incoming_status != "login_required_downloadable" and not has_login else "login_required_downloadable"
+        visible_files = item.get("visible_files") if isinstance(item.get("visible_files"), list) else []
+        status = "login_required_downloadable" if incoming_status == "login_required_downloadable" and visible_files else "manual_action_required"
         score = 40; needs_ai = True; match_value = "UNKNOWN"; reasons.append("access-gated candidate without explicit file format; needs rubric adjudication")
     elif has_platform or url:
         status = "page_candidate"; score = 30; needs_ai = True; match_value = "UNKNOWN"; reasons.append("page candidate without explicit file format; needs rubric adjudication")

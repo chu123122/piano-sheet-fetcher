@@ -135,6 +135,7 @@ sheet-music/
 
 这个仓库目前是“rubric 化的曲谱查找 skill v0.2”：
 
-- `piano_score` / `midi` 已完成一轮真实入口回归；
-- `numbered_notation` / `guitar_tab` / `full_score` / `any_score` 已有 rubric 草案，但仍应视为 experimental，点亮前需要各自跑真实样本回归；
+- `piano_score` 已完成一轮受限真实回归（10 首、默认多源但降低单首探测上限）：可用 6/10，危险误判 0；仍建议在发布前跑默认高召回复验。
+- `midi` 已完成格式级分类与 profile 查询词配置，但来源召回仍偏弱；5 首代表样本重跑仅 `ただ君に晴れ` 直接下载到 `.mid`，因此仍应视为 experimental recall。
+- `numbered_notation` / `guitar_tab` / `full_score` / `any_score` 已有 rubric 草案，但仍应视为 experimental，点亮前需要各自跑真实样本回归。
 - source plugin 架构已有雏形，新增来源应注册 source plugin，而不是继续往核心分类器里堆 `if/elif`。

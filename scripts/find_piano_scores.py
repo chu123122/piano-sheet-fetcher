@@ -45,6 +45,7 @@ from profile_utils import (  # noqa: E402
     profile_auxiliary_formats,
     profile_names,
     profile_rubric_text,
+    profile_success_formats,
     profile_target_kinds,
     profile_target_suffixes,
 )
@@ -564,21 +565,32 @@ def handle_link(song: Song, link: str, source_url: str, source_title: str, chann
     return classify_page(link, source_url, source_title, channel)
 
 
-def build_queries(song: Song) -> list[str]:
+def profile_search_terms(profile: dict[str, Any]) -> list[str]:
+    terms = [str(x).strip() for x in profile.get("search_terms", []) if str(x).strip()]
+    if terms:
+        return ordered_unique(terms)
+    return ordered_unique(sorted(profile_success_formats(profile)))
+
+
+def build_queries(song: Song, profile: dict[str, Any] | None = None) -> list[str]:
     names = [song.title, *song.aliases]
     if song.artist:
         names.append(f"{song.title} {song.artist}")
+    terms = profile_search_terms(profile or {}) or ["sheet music"]
+    joined_terms = " ".join(terms[:4])
+    first_term = terms[0]
     templates = [
-        "{q} piano sheet pdf",
+        "{q} {terms}",
+        "{q} {first} download",
+        "{q} {first} file",
         "{q} sheet music download",
-        "{q} pdf mscz musicxml",
-        "{q} site:sheet.host",
-        "{q} site:drive.google.com piano sheet",
+        "{q} site:sheet.host {first}",
+        "{q} site:drive.google.com {first}",
     ]
     qs: list[str] = []
     for n in names:
         for t in templates:
-            q = t.format(q=n).strip()
+            q = t.format(q=n, terms=joined_terms, first=first_term).strip()
             if q not in qs:
                 qs.append(q)
     return qs
@@ -636,7 +648,7 @@ def discover_youtube(ctx: SourceContext) -> tuple[list[Record], list[dict[str, A
     logs: list[dict[str, Any]] = []
     seen_videos: list[str] = []
     seen_urls: set[str] = set()
-    for q in build_queries(ctx.song):
+    for q in build_queries(ctx.song, ctx.profile):
         urls, status = youtube_search(q, ctx.youtube_limit)
         logs.append({"channel": "youtube_search", "query": q, "status": status, "found": len(urls)})
         for u in urls:
@@ -705,7 +717,7 @@ def discover_github(ctx: SourceContext) -> tuple[list[Record], list[dict[str, An
     logs: list[dict[str, Any]] = []
     seen: set[str] = set()
     queries = []
-    for q in build_queries(ctx.song):
+    for q in build_queries(ctx.song, ctx.profile):
         queries.append(f"{q} site:github.com")
         queries.append(f"{q} site:gist.github.com")
     for q in queries[:ctx.web_limit * 2]:
@@ -730,7 +742,7 @@ def discover_web(ctx: SourceContext) -> tuple[list[Record], list[dict[str, Any]]
     records: list[Record] = []
     logs: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for q in build_queries(ctx.song)[:ctx.web_limit]:
+    for q in build_queries(ctx.song, ctx.profile)[:ctx.web_limit]:
         urls, status = bing_search(q, 8)
         logs.append({"channel": "web_search", "query": q, "status": status, "found": len(urls)})
         for u in urls:
@@ -858,7 +870,7 @@ def apply_step7(classified: list[dict[str, Any]], target_profile: str, profile: 
                 item["status"] = "page_candidate"
             item["match"] = {target_profile: "UNKNOWN"}
             item["score"] = min(int(item.get("score") or 0), 40)
-            item["reasons"] = [*item.get("reasons", []), "step7 conservative fallback: keep as page_candidate, do not download"]
+            item["reasons"] = [*item.get("reasons", []), f"step7 conservative fallback: keep as {item.get('status')}, do not download"]
             item["needs_ai"] = False
         resolved.append(item)
     unresolved = [x for x in resolved if x.get("needs_ai")]
